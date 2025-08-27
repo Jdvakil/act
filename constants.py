@@ -1,7 +1,7 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '<put your data dir here>'
+DATA_DIR = '/home/jaydv/code/proximity_learning/data'
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
@@ -29,6 +29,22 @@ SIM_TASK_CONFIGS = {
         'num_episodes': 50,
         'episode_len': 500,
         'camera_names': ['top']
+    },
+}
+
+TASK_CONFIGS = {
+    'test': {
+        'dataset_dir': '/home/jaydv/code/proximity_learning/act_episodes',
+        'num_episodes': 200,  # Your dataset has 200 episodes
+        'episode_len': 50,    # Maximum episode length (for padding consistency)
+        'camera_names': ['top']
+    },
+    
+    'proximity_learning': {
+        'dataset_dir': '/home/jaydv/code/proximity_learning/proximity_learning_dataset_episodes',
+        'num_episodes': 200,  # Your dataset has 200 episodes
+        'episode_len': 50,    # Maximum episode length (for padding consistency)
+        'camera_names': ['top']  # Images saved as 'top' in HDF5
     },
 }
 
