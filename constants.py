@@ -1,7 +1,7 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '/home/jaydv/code/proximity_learning/data'
+DATA_DIR = ''
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
@@ -25,26 +25,28 @@ SIM_TASK_CONFIGS = {
     },
 
     'sim_insertion_human': {
-        'dataset_dir': DATA_DIR + '/sim_insertion_human',
+        'dataset_dir': '/home/jaydv/code/sim_data_act',
         'num_episodes': 50,
         'episode_len': 500,
         'camera_names': ['top']
     },
-}
 
-TASK_CONFIGS = {
-    'test': {
-        'dataset_dir': '/home/jaydv/code/proximity_learning/act_episodes',
-        'num_episodes': 200,  # Your dataset has 200 episodes
-        'episode_len': 50,    # Maximum episode length (for padding consistency)
-        'camera_names': ['top']
+    # IsaacLab dataset (converted from train_data_153.hdf5)
+    'sim_isaac_task': {
+        'dataset_dir': '/home/jaydv/code/isaac-data/act_format',
+        'num_episodes': 279,
+        'episode_len': 268,  # max episode length across all demos
+        'camera_names': ['table_cam', 'wrist_cam'],
+        'state_dim': 7,    # action dimension (7-DOF actions)
+        'qpos_dim': 9,     # joint_pos dimension (7 arm + 2 finger joints)
     },
-    
-    'proximity_learning': {
-        'dataset_dir': '/home/jaydv/code/proximity_learning/proximity_learning_dataset_episodes',
-        'num_episodes': 200,  # Your dataset has 200 episodes
-        'episode_len': 50,    # Maximum episode length (for padding consistency)
-        'camera_names': ['top']  # Images saved as 'top' in HDF5
+    'sim_isaac_task_drawer': {
+        'dataset_dir': '/home/jaydv/code/isaac-data/drawer_act_format',
+        'num_episodes': 200,
+        'episode_len': 600,  # max steps per episode (from collect_demos_sm.yaml)
+        'camera_names': ['front_cam', 'wrist_cam'],
+        'state_dim': 8,    # action dimension: pos(3) + quat(4) + gripper(1)
+        'qpos_dim': 9,     # joint_pos dimension (7 arm + 2 finger joints)
     },
 }
 

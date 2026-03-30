@@ -5,8 +5,15 @@ import pickle
 import argparse
 import matplotlib.pyplot as plt
 from copy import deepcopy
+from datetime import datetime
 from tqdm import tqdm
 from einops import rearrange
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
@@ -39,7 +46,7 @@ def main(args):
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
     else:
-        from constants import TASK_CONFIGS
+        from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
     dataset_dir = task_config['dataset_dir']
     num_episodes = task_config['num_episodes']
@@ -47,10 +54,8 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    if task_name in ['test', 'proximity_learning']:  # Your custom tasks
-        state_dim = 9  # Your robot has 9 joints
-    else:
-        state_dim = 14  # Default for other tasks
+    state_dim = task_config.get('state_dim', 14)   # action dimension
+    qpos_dim = task_config.get('qpos_dim', state_dim)  # proprioception input dimension
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -69,10 +74,11 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          'state_dim': state_dim,
+                         'qpos_dim': qpos_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim,}
+                         'camera_names': camera_names, 'state_dim': state_dim, 'qpos_dim': qpos_dim,}
     else:
         raise NotImplementedError
 
@@ -81,6 +87,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'qpos_dim': qpos_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -89,7 +96,10 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'wandb_project': args.get('wandb_project'),
+        'wandb_entity': args.get('wandb_entity'),
+        'wandb_run_name': args.get('wandb_run_name'),
     }
 
     if is_eval:
@@ -104,7 +114,7 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, args['chunk_size'])
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, max_episode_len=episode_len)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -220,9 +230,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
         ### evaluation loop
         if temporal_agg:
-            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
+            all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, config['state_dim']]).cuda()
 
-        qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
+        qpos_history = torch.zeros((1, max_timesteps, config.get('qpos_dim', config['state_dim']))).cuda()
         image_list = [] # for visualization
         qpos_list = []
         target_qpos_list = []
@@ -332,6 +342,30 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     set_seed(seed)
 
+    # wandb setup
+    use_wandb = WANDB_AVAILABLE and config.get('wandb_project') is not None
+    if use_wandb:
+        run_name = config.get('wandb_run_name') or \
+            f"{config['task_name']}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        wandb.init(
+            project=config['wandb_project'],
+            entity=config.get('wandb_entity'),
+            name=run_name,
+            config={
+                'task_name': config['task_name'],
+                'policy_class': policy_class,
+                'num_epochs': num_epochs,
+                'seed': seed,
+                'lr': config['lr'],
+                'state_dim': config['state_dim'],
+                'qpos_dim': config.get('qpos_dim', config['state_dim']),
+                'episode_len': config['episode_len'],
+                **{k: v for k, v in policy_config.items() if k != 'camera_names'},
+            },
+        )
+    elif config.get('wandb_project') and not WANDB_AVAILABLE:
+        print('wandb not installed — run `pip install wandb` to enable logging.')
+
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
@@ -381,6 +415,14 @@ def train_bc(train_dataloader, val_dataloader, config):
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
+        if use_wandb:
+            log_dict = {'epoch': epoch, 'train/loss': epoch_train_loss, 'val/loss': epoch_val_loss}
+            for k, v in epoch_summary.items():
+                log_dict[f'train/{k}'] = v.item()
+            for k, v in compute_dict_mean(epoch_dicts).items():
+                log_dict[f'val/{k}'] = v.item()
+            wandb.log(log_dict, step=epoch)
+
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
@@ -393,6 +435,11 @@ def train_bc(train_dataloader, val_dataloader, config):
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
+
+    if use_wandb:
+        wandb.summary['best_epoch'] = best_epoch
+        wandb.summary['best_val_loss'] = min_val_loss
+        wandb.finish()
 
     # save training curves
     plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
@@ -435,5 +482,10 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    
+
+    # wandb
+    parser.add_argument('--wandb_project', type=str, default="act_prox", help='W&B project name. Omit to disable.')
+    parser.add_argument('--wandb_entity', type=str, default="jayluvsgeography", help='W&B entity/username.')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run name (default: auto).')
+
     main(vars(parser.parse_args()))

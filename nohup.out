@@ -1,0 +1,15 @@
+/opt/conda/envs/ilab/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+/opt/conda/envs/ilab/lib/python3.10/site-packages/pydantic/_internal/_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+usage: imitate_episodes.py [-h] [--eval] [--onscreen_render] --ckpt_dir
+                           CKPT_DIR --policy_class POLICY_CLASS --task_name
+                           TASK_NAME --batch_size BATCH_SIZE --seed SEED
+                           --num_epochs NUM_EPOCHS --lr LR
+                           [--kl_weight KL_WEIGHT] [--chunk_size CHUNK_SIZE]
+                           [--hidden_dim HIDDEN_DIM]
+                           [--dim_feedforward DIM_FEEDFORWARD]
+                           [--temporal_agg] [--wandb_project WANDB_PROJECT]
+                           [--wandb_entity WANDB_ENTITY]
+                           [--wandb_run_name WANDB_RUN_NAME]
+imitate_episodes.py: error: argument --num_epochs: expected one argument

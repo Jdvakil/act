@@ -1,4 +1,7 @@
 import os
+import subprocess
+import tempfile
+from typing import List
 import numpy as np
 import cv2
 import h5py
@@ -41,38 +44,43 @@ def main(args):
     # visualize_timestamp(t_list, dataset_path) # TODO addn timestamp back
 
 
+def _write_h264(frames_bgr: List[np.ndarray], fps: int, video_path: str) -> None:
+    """Write frames to an H.264/MP4 file that VS Code can play inline."""
+    h, w = frames_bgr[0].shape[:2]
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
+    try:
+        out = cv2.VideoWriter(tmp.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        for f in frames_bgr:
+            out.write(f)
+        out.release()
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp.name,
+             "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+             video_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    finally:
+        os.unlink(tmp.name)
+
+
 def save_videos(video, dt, video_path=None):
     if isinstance(video, list):
         cam_names = list(video[0].keys())
-        h, w, _ = video[0][cam_names[0]].shape
-        w = w * len(cam_names)
         fps = int(1/dt)
-        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-        for ts, image_dict in enumerate(video):
-            images = []
-            for cam_name in cam_names:
-                image = image_dict[cam_name]
-                image = image[:, :, [2, 1, 0]] # swap B and R channel
-                images.append(image)
-            images = np.concatenate(images, axis=1)
-            out.write(images)
-        out.release()
+        frames = []
+        for image_dict in video:
+            images = [image_dict[c][:, :, [2, 1, 0]] for c in cam_names]
+            frames.append(np.concatenate(images, axis=1))
+        _write_h264(frames, fps, video_path)
         print(f'Saved video to: {video_path}')
     elif isinstance(video, dict):
         cam_names = list(video.keys())
-        all_cam_videos = []
-        for cam_name in cam_names:
-            all_cam_videos.append(video[cam_name])
-        all_cam_videos = np.concatenate(all_cam_videos, axis=2) # width dimension
-
-        n_frames, h, w, _ = all_cam_videos.shape
+        all_cam_videos = np.concatenate([video[c] for c in cam_names], axis=2)
+        n_frames = all_cam_videos.shape[0]
         fps = int(1 / dt)
-        out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-        for t in range(n_frames):
-            image = all_cam_videos[t]
-            image = image[:, :, [2, 1, 0]]  # swap B and R channel
-            out.write(image)
-        out.release()
+        frames = [all_cam_videos[t][:, :, [2, 1, 0]] for t in range(n_frames)]
+        _write_h264(frames, fps, video_path)
         print(f'Saved video to: {video_path}')
 
 
