@@ -41,7 +41,7 @@ def main(args):
     else:
         from constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
+    dataset_dir = "/home/qinzhengfangli/molmo_test/molmospaces/molmo-pick-dataset/data"
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
@@ -104,7 +104,18 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, args['chunk_size'])
+    from molmo_loader import MolmoDataset
+    from torch.utils.data import DataLoader
+    dataset = MolmoDataset(dataset_dir, camera_names, args['chunk_size'])
+    train_dataloader = DataLoader(dataset, batch_size=batch_size_train, shuffle=True)
+    val_dataloader = DataLoader(dataset, batch_size=batch_size_val)
+    stats = {
+        "qpos_mean": 0,
+        "qpos_std": 1,
+        "action_mean": 0,
+        "action_std": 1
+    }
+
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -188,8 +199,8 @@ def eval_bc(config, ckpt_name, save_episode=True):
         env = make_real_env(init_node=True)
         env_max_reward = 0
     else:
-        from sim_env import make_sim_env
-        env = make_sim_env(task_name)
+        from molmo_spaces.simulation import make_env
+        env = make_env(task_type="pick")
         env_max_reward = env.task.max_reward
 
     query_frequency = policy_config['num_queries']

@@ -1,3 +1,20 @@
+# ACT Training on Molmo Dataset (Custom Adaptation)
+
+This repository extends the original ACT implementation by adapting it to a Molmo-generated dataset.
+
+## My Contributions
+
+- Implemented a custom dataset loader (`molmo_loader.py`) to convert Molmo h5 data into ACT-compatible format
+- Ran ACT training using the dataset and generated checkpoints
+- Wrote an evaluation script (`eval_molmo.py`) to load the trained model and run inference
+
+## Notes
+
+- Dataset and checkpoints are not included in this repository
+- The evaluation script currently uses a simplified loop for testing model inference
+
+
+
 # ACT: Action Chunking with Transformers
 
 ### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
