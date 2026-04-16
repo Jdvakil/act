@@ -1,8 +1,8 @@
 import sys
 sys.argv = ["ignore"]
-sys.path.append("/home/qinzhengfangli/molmo_test/molmospaces")
 
 import types
+
 fake_module = types.ModuleType("molmospaces_resources")
 
 class Dummy:
@@ -12,6 +12,7 @@ class Dummy:
 def dummy_fn(*args, **kwargs):
     return None
 
+fake_module.PickleLMDBMap = Dummy
 fake_module.HFRemoteStorage = Dummy
 fake_module.LocalStorage = Dummy
 fake_module.ResourceManager = Dummy
@@ -20,22 +21,45 @@ fake_module.S3RemoteStorage = Dummy
 fake_module.GCSRemoteStorage = Dummy
 fake_module.FileSystemStorage = Dummy
 fake_module.str2bool = dummy_fn
-# 新增这些函数名
 fake_module.setup_resource_manager = dummy_fn
 fake_module.get_resource_manager = dummy_fn
 fake_module.get_scenes = dummy_fn
+fake_module.split_query_tokens = dummy_fn
+
 
 sys.modules["molmospaces_resources"] = fake_module
 
 
+sys.path.append("/home/qinzhengfangli/molmo_test/molmospaces")
+sys.path.append("/home/qinzhengfangli/act/detr")
 
-import molmo_spaces.resources as molmospaces_resources
 
 
 import torch
 import numpy as np
+from molmo_spaces.tasks.pick_task_sampler import PickTaskSampler
 
-# ===== 正确加载模型（绕开 argparse）=====
+from types import SimpleNamespace
+
+task_sampler_config = SimpleNamespace(
+    model_copy=lambda deep:SimpleNamespace(),
+    house_inds=[0],
+    pickup_types=None,
+)
+
+config = SimpleNamespace(
+    seed=0,
+    num_envs=1,
+    task_sampler_config=task_sampler_config,
+    task_config_preset_exp=None,
+    task_config=task_sampler_config,
+    scene_dataset="procthor-10k",
+    data_split="train",
+)
+
+sampler = PickTaskSampler(config)
+
+
 from detr.main import build_ACT_model
 
 class DummyArgs:
@@ -76,11 +100,11 @@ model.load_state_dict(new_state_dict)
 model.cuda()
 model.eval()
 
-print("✅ Model loaded successfully")
+print(" Model loaded successfully")
 
-print("🔥 Running evaluation with task sampler...")
+print(" Running evaluation with task sampler...")
 
-print("🔥 Running evaluation...")
+print(" Running evaluation...")
 
 num_episodes = 3
 success = 0
@@ -88,14 +112,35 @@ success = 0
 for ep in range(num_episodes):
     print(f"Episode {ep}")
 
-    for t in range(50):
-        qpos = torch.zeros((1, 9)).cuda()
-        image = torch.zeros((1, 1, 3, 64, 64)).cuda()
+    task = sampler.sample_task()
+    env = task.make_env()
+
+    obs = env.reset()
+
+    done = False
+    step = 0
+
+    while not done and step < 50:
+        print(obs.keys())
+
+        image = obs["image"]
+        qpos = obs["qpos"]
+
+        image = torch.tensor(image).permute(2,0,1).unsqueeze(0).unsqueeze(0).float().cuda()
+        qpos = torch.tensor(qpos).unsqueeze(0).float().cuda()
 
         with torch.no_grad():
             action, _, _ = model(qpos, image, None, None, None)
 
-    success += 1
+        action = action.squeeze(0).cpu().numpy()
+
+        obs, reward, done, info = env.step(action)
+
+        step += 1
+
+    if info.get("success", False):
+        success += 1
+
 
 print("🔥 Success rate:", success / num_episodes)
 
