@@ -21,6 +21,12 @@ from sim_env import BOX_POSE
 import IPython
 e = IPython.embed
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 def main(args):
     set_seed(1)
     # command line parameters
@@ -49,8 +55,14 @@ def main(args):
     # fixed parameters
     if task_name in ['test', 'proximity_learning']:  # Your custom tasks
         state_dim = 9  # Your robot has 9 joints
+        action_dim = state_dim
+    elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random'):
+        # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
+        state_dim = 9
+        action_dim = 8
     else:
         state_dim = 14  # Default for other tasks
+        action_dim = state_dim
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -69,10 +81,12 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          'state_dim': state_dim,
+                         'action_dim': action_dim,
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
-                         'camera_names': camera_names, 'state_dim': state_dim,}
+                         'camera_names': camera_names, 'state_dim': state_dim,
+                         'action_dim': action_dim}
     else:
         raise NotImplementedError
 
@@ -81,6 +95,7 @@ def main(args):
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
         'state_dim': state_dim,
+        'action_dim': action_dim,
         'lr': args['lr'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
@@ -89,7 +104,10 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'use_wandb': args.get('use_wandb', False),
+        'wandb_project': args.get('wandb_project', 'act-pla-house1'),
+        'wandb_run_name': args.get('wandb_run_name', None),
     }
 
     if is_eval:
@@ -329,8 +347,26 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    use_wandb = config.get('use_wandb', False) and _WANDB_AVAILABLE
 
     set_seed(seed)
+
+    if use_wandb:
+        wandb.init(
+            project=config.get('wandb_project', 'act-pla-house1'),
+            name=config.get('wandb_run_name'),
+            dir=ckpt_dir,
+            config={
+                'task_name': config['task_name'],
+                'policy_class': policy_class,
+                'num_epochs': num_epochs,
+                'seed': seed,
+                'state_dim': config['state_dim'],
+                'action_dim': config['action_dim'],
+                'camera_names': config['camera_names'],
+                **{k: v for k, v in policy_config.items() if isinstance(v, (int, float, str, list, tuple, bool))},
+            },
+        )
 
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
@@ -380,6 +416,14 @@ def train_bc(train_dataloader, val_dataloader, config):
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
+
+        if use_wandb:
+            log_dict = {'epoch': epoch, 'min_val_loss': float(min_val_loss)}
+            for k, v in epoch_summary.items():
+                log_dict[f'train/{k}'] = float(v.item())
+            for k, v in validation_history[-1].items():
+                log_dict[f'val/{k}'] = float(v.item())
+            wandb.log(log_dict, step=epoch)
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
@@ -435,5 +479,11 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
-    
+
+    # wandb
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='Log train/val losses to Weights & Biases.')
+    parser.add_argument('--wandb_project', type=str, default='act-pla-house1')
+    parser.add_argument('--wandb_run_name', type=str, default=None)
+
     main(vars(parser.parse_args()))

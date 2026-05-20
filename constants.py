@@ -46,6 +46,31 @@ TASK_CONFIGS = {
         'episode_len': 50,    # Maximum episode length (for padding consistency)
         'camera_names': ['top']  # Images saved as 'top' in HDF5
     },
+
+    'pla_house1_mug': {
+        # PLA house_1 mug pickup, 250 episodes. qpos=9 (arm7+2 fingers),
+        # action=8 (arm7+gripper_cmd1). Episodes are 261 frames each.
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/pla_house1_mug_v1',
+        'num_episodes': 250,
+        'episode_len': 261,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pla_smoke': {
+        # PLA smoke set: 10 houses × ~3-4 trajs = 36 episodes. Episode lengths
+        # vary (223-301, mean 261). Used for the proximity-residual experiment.
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/smoke_v1',
+        'num_episodes': 36,
+        'episode_len': 301,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pla_house1_mug_random': {
+        # PLA house_1 mug pickup, randomized everything: 356 episodes,
+        # T 220-301 (median 291). Source = mug_house_1_random_everything datagen.
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/mug_house1_random_everything',
+        'num_episodes': 356,
+        'episode_len': 301,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants

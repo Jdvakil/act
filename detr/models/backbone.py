@@ -11,12 +11,15 @@ from torch import nn
 from torchvision.models._utils import IntermediateLayerGetter
 from typing import Dict, List
 
-from util.misc import NestedTensor, is_main_process
+from ..util.misc import NestedTensor, is_main_process
 
 from .position_encoding import build_position_encoding
 
-import IPython
-e = IPython.embed
+try:
+    import IPython
+    e = IPython.embed
+except ImportError:
+    e = None
 
 class FrozenBatchNorm2d(torch.nn.Module):
     """

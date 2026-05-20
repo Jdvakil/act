@@ -49,11 +49,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
 
         self.is_sim = is_sim
-        # Pad actions to num_queries for ACT model consistency
+        # Pad actions to num_queries for ACT model consistency. When the
+        # remaining horizon is longer than num_queries we truncate (the
+        # network only predicts num_queries steps ahead anyway).
         padded_action = np.zeros((self.num_queries, original_action_shape[1]), dtype=np.float32)
-        padded_action[:action_len] = action
+        n_real = min(action_len, self.num_queries)
+        padded_action[:n_real] = action[:n_real]
         is_pad = np.zeros(self.num_queries)
-        is_pad[action_len:] = 1
+        is_pad[n_real:] = 1
 
         # new axis for different cameras
         all_cam_images = []

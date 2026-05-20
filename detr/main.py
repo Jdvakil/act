@@ -63,6 +63,15 @@ def get_args_parser():
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    # new flags added by the pla_house1_mug pipeline (--onscreen_render is
+    # already declared above by the original ACT stub list).
+    parser.add_argument('--use_wandb', action='store_true')
+    parser.add_argument('--wandb_project', type=str, default='act-pla-house1')
+    parser.add_argument('--wandb_run_name', type=str, default=None)
+    # action_dim is plumbed through args_override in build_ACT_model_and_optimizer,
+    # so it doesn't need a CLI flag, but declaring it keeps argparse from
+    # complaining if someone passes it on the command line.
+    parser.add_argument('--action_dim', type=int, default=None)
 
     return parser
 
