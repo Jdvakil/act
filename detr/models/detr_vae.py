@@ -36,7 +36,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names,
+                 action_dim=None, n_proximity_sensors=0):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -47,6 +48,10 @@ class DETRVAE(nn.Module):
             action_dim: action vector dimension. Defaults to state_dim (Aloha-style symmetric)
                 but may differ — e.g. Franka skin tasks have qpos=9 (arm7+2 fingers) and
                 action=8 (arm7+gripper_cmd1).
+            n_proximity_sensors: when > 0, the model expects an extra
+                `proximity_positions` argument of shape (B, n_proximity_sensors, 3)
+                in `forward` and projects+concatenates one extra encoder token
+                per sensor. Default 0 keeps the model bit-identical to vanilla ACT.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
@@ -58,6 +63,7 @@ class DETRVAE(nn.Module):
         self.encoder = encoder
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.n_proximity_sensors = int(n_proximity_sensors)
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, action_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
@@ -83,14 +89,28 @@ class DETRVAE(nn.Module):
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
-        self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
+        # Position embedding covers [latent, proprio] (always) plus one slot per
+        # proximity sensor (when enabled). Default size matches vanilla ACT.
+        self.additional_pos_embed = nn.Embedding(2 + self.n_proximity_sensors, hidden_dim)
+        if self.n_proximity_sensors > 0:
+            # Per-sensor projection from 3-D position (metres) into the encoder
+            # token space. Shared across all sensors.
+            self.input_proj_proximity = nn.Linear(3, hidden_dim)
+        else:
+            self.input_proj_proximity = None
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None,
+                proximity_positions=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
         env_state: None
         actions: batch, seq, action_dim
+        proximity_positions: when self.n_proximity_sensors > 0, a tensor of
+            shape (batch, n_proximity_sensors, 3) holding the predicted 3-D
+            object position in each sensor's local frame (metres). When None
+            and n_proximity_sensors == 0, the model is bit-identical to vanilla
+            ACT.
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
@@ -138,7 +158,26 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+
+            # Project proximity positions into hidden_dim tokens when enabled.
+            # Shape: (n_proximity_sensors, bs, hidden_dim) for the transformer.
+            proximity_input = None
+            if self.n_proximity_sensors > 0:
+                if proximity_positions is None:
+                    raise ValueError(
+                        "DETRVAE was built with n_proximity_sensors > 0 but "
+                        "forward() got proximity_positions=None"
+                    )
+                if proximity_positions.shape[1] != self.n_proximity_sensors:
+                    raise ValueError(
+                        f"proximity_positions has {proximity_positions.shape[1]} "
+                        f"sensors but model expects {self.n_proximity_sensors}"
+                    )
+                # (B, N, 3) -> (B, N, hidden) -> (N, B, hidden)
+                proximity_input = self.input_proj_proximity(proximity_positions)
+                proximity_input = proximity_input.permute(1, 0, 2)
+
+            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight, proximity_input)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
@@ -252,6 +291,8 @@ def build(args):
 
     encoder = build_encoder(args)
 
+    n_proximity_sensors = int(getattr(args, "n_proximity_sensors", 0) or 0)
+
     model = DETRVAE(
         backbones,
         transformer,
@@ -260,6 +301,7 @@ def build(args):
         num_queries=args.num_queries,
         camera_names=args.camera_names,
         action_dim=action_dim,
+        n_proximity_sensors=n_proximity_sensors,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

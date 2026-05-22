@@ -72,6 +72,17 @@ def get_args_parser():
     # so it doesn't need a CLI flag, but declaring it keeps argparse from
     # complaining if someone passes it on the command line.
     parser.add_argument('--action_dim', type=int, default=None)
+    # P+ACT: number of proximity sensors. Default 0 makes the model bit-identical
+    # to vanilla ACT (no proximity tokens, no extra Linear, the additional
+    # position embedding stays at (2, hidden_dim)).
+    parser.add_argument('--n_proximity_sensors', type=int, default=0)
+    # P+ACT: trainer-side flags consumed by `pact.act_prox.imitate_episodes_with_prox`.
+    # ACT's internal argparse must accept them here (as no-ops) so they don't
+    # error out when the trainer constructs the policy.
+    parser.add_argument('--use_proximity', action='store_true')
+    parser.add_argument('--prox_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--prox_mapping_json', type=str, default=None)
+    parser.add_argument('--num_workers', type=int, default=1)
 
     return parser
 

@@ -49,7 +49,13 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None):
+    def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None,
+                additional_pos_embed=None, proximity_input=None):
+        """`proximity_input`: optional, shape (n_proximity_sensors, bs, d_model).
+        When provided, those tokens are inserted between [latent, proprio] and
+        the image features. `additional_pos_embed` is expected to be sized to
+        cover [latent, proprio, prox_1..prox_N] already (the caller — DETRVAE —
+        guarantees this when n_proximity_sensors > 0)."""
         # TODO flatten only when input has H and W
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -63,6 +69,8 @@ class Transformer(nn.Module):
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
             addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            if proximity_input is not None:
+                addition_input = torch.cat([addition_input, proximity_input], axis=0)
             src = torch.cat([addition_input, src], axis=0)
         else:
             assert len(src.shape) == 3
