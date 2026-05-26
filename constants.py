@@ -71,6 +71,24 @@ TASK_CONFIGS = {
         'episode_len': 301,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
+    'pla_house3_mug_random': {
+        # PLA house_3 mug pickup, randomized everything: 132 episodes,
+        # T 180-301 (median 269). Source = mug_house_3_random_everything
+        # datagen (collected 2026-05-24, 3 parallel run_data.sh chunks).
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/mug_house3_random_everything',
+        'num_episodes': 132,
+        'episode_len': 301,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pla_houses_1_3_mug_random': {
+        # PLA combined house_1 + house_3 mug pickup, randomized everything:
+        # 488 episodes (356 from h1, 132 from h3 appended at indices 356..487
+        # via symlinks; see scripts/build_combined_h1_h3.py).
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/mug_houses_1_3_random_everything',
+        'num_episodes': 488,
+        'episode_len': 301,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants
