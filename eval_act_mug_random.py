@@ -79,11 +79,44 @@ from utils import set_seed
 
 # molmospaces imports — eval target env / policy framework
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
+from molmo_spaces.configs.task_sampler_configs import PickAndPlaceTaskSamplerConfig
 from molmo_spaces.data_generation.config.object_manipulation_datagen_configs import (
-    FrankaSkinPickAndPlacePilotMediumConfig,
+    FrankaSkinPickAndPlacePilotConfig,
 )
 from molmo_spaces.data_generation.pipeline import ParallelRolloutRunner
+from molmo_spaces.molmo_spaces_constants import ASSETS_DIR
 from molmo_spaces.policy.base_policy import InferencePolicy
+from molmo_spaces.tasks.pick_and_place_task_sampler import PickAndPlaceTaskSampler
+from molmo_spaces.utils.constants.object_constants import PICK_AND_PLACE_OBJECTS
+
+
+# ----------------------------------------------------------------------
+# Inline reproduction of the original `FrankaSkinPickAndPlacePilotMediumConfig`
+# (the class the `mug_house1_random_everything` dataset was collected with at
+# molmospaces commit 15a748b). Upstream HEAD renamed it to `PACT` and stripped
+# the randomization knobs + repointed output_dir, which would silently change
+# the eval distribution. Reproducing here keeps eval matched to the dataset.
+# DO NOT MODIFY.
+# ----------------------------------------------------------------------
+class _DatagenMediumMatchedConfig(FrankaSkinPickAndPlacePilotConfig):
+    seed: int | None = 2026
+    num_workers: int = 1
+    task_sampler_config: PickAndPlaceTaskSamplerConfig = PickAndPlaceTaskSamplerConfig(
+        task_sampler_class=PickAndPlaceTaskSampler,
+        pickup_types=PICK_AND_PLACE_OBJECTS,
+        samples_per_house=1,
+        house_inds=[1],
+        max_allowed_sequential_irrecoverable_failures=10000,
+        robot_object_z_offset_random_min=-np.random.uniform(0.0, 1.0),
+        robot_object_z_offset_random_max=np.random.uniform(0.0, 1.0),
+        robot_placement_rotation_range_rad=0.52,
+        randomize_lighting=True,
+    )
+    output_dir: Path = ASSETS_DIR / "datagen" / "mug_house_1_random_everything"
+
+    @property
+    def tag(self) -> str:
+        return "franka_skin_pick_and_place_pilot_medium"
 
 
 # ----------------------------------------------------------------------
@@ -242,7 +275,7 @@ class ACTPolicyConfig(BasePolicyConfig):
 # (same task_sampler_config, same seed=2026, same randomize_lighting, same
 # samples_per_house=1, same house_inds=[1]). Only swaps the policy in.
 # ----------------------------------------------------------------------
-class ACTMugRandomEvalConfig(FrankaSkinPickAndPlacePilotMediumConfig):
+class ACTMugRandomEvalConfig(_DatagenMediumMatchedConfig):
     """ACT eval against the same env used to collect mug_house_1_random_everything.
 
     Inherits every field of FrankaSkinPickAndPlacePilotMediumConfig — including

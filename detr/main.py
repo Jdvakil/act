@@ -76,6 +76,10 @@ def get_args_parser():
     # to vanilla ACT (no proximity tokens, no extra Linear, the additional
     # position embedding stays at (2, hidden_dim)).
     parser.add_argument('--n_proximity_sensors', type=int, default=0)
+    # P+ACT: K tokens per sensor. K=1 (default) = original behaviour.
+    # K>1 expands each (3-D) prox position to K hidden_dim encoder tokens so the
+    # prox stream has total-token parity with the image stream (~160 image tokens).
+    parser.add_argument('--prox_tokens_per_sensor', type=int, default=1)
     # P+ACT: trainer-side flags consumed by `pact.act_prox.imitate_episodes_with_prox`.
     # ACT's internal argparse must accept them here (as no-ops) so they don't
     # error out when the trainer constructs the policy.
