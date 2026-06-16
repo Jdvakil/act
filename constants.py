@@ -89,6 +89,20 @@ TASK_CONFIGS = {
         'episode_len': 301,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
+    'obstacle_baseline': {
+        # VANILLA ACT BASELINE (rgb + qpos, NO proximity) on the one-env obstacle
+        # pick: red cup in the fumehood, hazard bar present ~75% of episodes.
+        # Source = scripts/convert_obstacle_to_act.py over the hybrid_obstacle_v1
+        # 20260612_183855 run (5 houses x 25 trajs -> 100 successful episodes after
+        # dropping fail[-1] trajectories). qpos=9 (arm7 + 2 fingers), action=8
+        # (arm7 + 1 gripper cmd). Source episode T: median 84, max 167.
+        # NOTE: set num_episodes / episode_len to whatever convert_obstacle_to_act.py
+        # printed for your run (it reports both at the end).
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/obstacle_v1',
+        'num_episodes': 100,
+        'episode_len': 169,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants

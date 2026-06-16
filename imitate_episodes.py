@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import datetime
 import pickle
 import argparse
 import matplotlib.pyplot as plt
@@ -16,7 +17,12 @@ from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
-from sim_env import BOX_POSE
+try:
+    from sim_env import BOX_POSE
+except Exception:
+    # sim_env pulls in dm_control, which is only needed for the upstream ALOHA
+    # eval path (eval_bc). Training and the in-env obstacle eval never use it.
+    BOX_POSE = [None]
 
 import IPython
 e = IPython.embed
@@ -56,7 +62,9 @@ def main(args):
     if task_name in ['test', 'proximity_learning']:  # Your custom tasks
         state_dim = 9  # Your robot has 9 joints
         action_dim = state_dim
-    elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random'):
+    elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random',
+                       'pla_house3_mug_random', 'pla_houses_1_3_mug_random',
+                       'obstacle_baseline'):
         # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
         state_dim = 9
         action_dim = 8
@@ -90,6 +98,20 @@ def main(args):
     else:
         raise NotImplementedError
 
+    # wandb: log by default (opt out with --no_wandb). Run name auto-built as
+    # taskname_numepochs_chunk_lr_seed unless --wandb_run_name is given.
+    use_wandb = not args.get('no_wandb', False)
+    wandb_run_name = args.get('wandb_run_name') or (
+        f"{task_name}_{num_epochs}_{args.get('chunk_size')}_{args['lr']}_{args['seed']}"
+    )
+
+    # Each training run gets its own dated folder: <ckpt_dir root>/<task>/<datetime>_<runname>/.
+    # --ckpt_dir is treated as the root (default 'ckpts'). Eval keeps the exact dir passed.
+    if not is_eval:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        ckpt_dir = os.path.join(ckpt_dir, task_name, f"{timestamp}_{wandb_run_name}")
+        print(f"[ckpt] saving this run to {ckpt_dir}")
+
     config = {
         'num_epochs': num_epochs,
         'ckpt_dir': ckpt_dir,
@@ -105,9 +127,9 @@ def main(args):
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
         'real_robot': not is_sim,
-        'use_wandb': args.get('use_wandb', False),
-        'wandb_project': args.get('wandb_project', 'act-pla-house1'),
-        'wandb_run_name': args.get('wandb_run_name', None),
+        'use_wandb': use_wandb,
+        'wandb_project': args.get('wandb_project', 'act-obstacle-baseline'),
+        'wandb_run_name': wandb_run_name,
     }
 
     if is_eval:
@@ -348,12 +370,14 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     use_wandb = config.get('use_wandb', False) and _WANDB_AVAILABLE
+    if config.get('use_wandb', False) and not _WANDB_AVAILABLE:
+        print('[wandb] requested but not installed — run `pip install wandb`. Skipping logging.')
 
     set_seed(seed)
 
     if use_wandb:
-        wandb.init(
-            project=config.get('wandb_project', 'act-pla-house1'),
+        run = wandb.init(
+            project=config.get('wandb_project', 'act-obstacle-baseline'),
             name=config.get('wandb_run_name'),
             dir=ckpt_dir,
             config={
@@ -367,6 +391,8 @@ def train_bc(train_dataloader, val_dataloader, config):
                 **{k: v for k, v in policy_config.items() if isinstance(v, (int, float, str, list, tuple, bool))},
             },
         )
+        print(f"[wandb] logging run '{config.get('wandb_run_name')}' "
+              f"(project {config.get('wandb_project')}): {run.url}")
 
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
@@ -465,7 +491,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    parser.add_argument('--ckpt_dir', action='store', type=str, default='ckpts',
+                        help='ckpt root; a run saves to <ckpt_dir>/<task>/<datetime>_<runname>/')
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
@@ -480,10 +507,14 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
 
-    # wandb
+    # wandb — on by default; opt out with --no_wandb. Run name auto-built as
+    # taskname_numepochs_chunk_lr_seed unless --wandb_run_name overrides it.
     parser.add_argument('--use_wandb', action='store_true',
-                        help='Log train/val losses to Weights & Biases.')
-    parser.add_argument('--wandb_project', type=str, default='act-pla-house1')
-    parser.add_argument('--wandb_run_name', type=str, default=None)
+                        help='(deprecated, on by default) Log to Weights & Biases.')
+    parser.add_argument('--no_wandb', action='store_true',
+                        help='Disable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', type=str, default='act-obstacle-baseline')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='Override the auto run name taskname_numepochs_chunk_lr_seed.')
 
     main(vars(parser.parse_args()))
