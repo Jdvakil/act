@@ -8,13 +8,19 @@ import IPython
 e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries,
+                 load_proximity=False):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.num_queries = num_queries
+        # P+ACT: when True, __getitem__ also returns the raw (40, 8, 8) proximity
+        # depths at start_ts (in meters, UN-normalized — the frozen Safety-CVAE
+        # extractor featurizes them itself). Requires /observations/proximity in
+        # the episode HDF5 (written by convert_obstacle_to_act.py --with_proximity).
+        self.load_proximity = load_proximity
         self.is_sim = None
         self.__getitem__(0) # initialize self.is_sim
 
@@ -40,6 +46,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
             image_dict = dict()
             for cam_name in self.camera_names:
                 image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            proximity = None
+            if self.load_proximity:
+                if '/observations/proximity' not in root:
+                    raise KeyError(
+                        f"{dataset_path} has no /observations/proximity — re-run "
+                        f"convert_obstacle_to_act.py with --with_proximity."
+                    )
+                proximity = root['/observations/proximity'][start_ts]  # (40, 8, 8) meters
             # get all actions after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
@@ -78,6 +92,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
+        if self.load_proximity:
+            # Raw depths in meters; the frozen CVAE extractor featurizes (closeness).
+            prox_data = torch.from_numpy(np.asarray(proximity, dtype=np.float32)).float()
+            return image_data, qpos_data, action_data, is_pad, prox_data
+
         return image_data, qpos_data, action_data, is_pad
 
 
@@ -114,7 +133,8 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
+              load_proximity=False):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -126,8 +146,10 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries)
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries,
+                                    load_proximity=load_proximity)
+    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries,
+                                  load_proximity=load_proximity)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

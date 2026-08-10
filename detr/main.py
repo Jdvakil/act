@@ -66,6 +66,10 @@ def get_args_parser():
     # new flags added by the pla_house1_mug pipeline (--onscreen_render is
     # already declared above by the original ACT stub list).
     parser.add_argument('--use_wandb', action='store_true')
+    # build_ACT_model_and_optimizer re-parses the full sys.argv, so every imitate_episodes
+    # flag must be accepted here (as a no-op) or model build dies with "unrecognized
+    # arguments". --no_wandb is one such flag.
+    parser.add_argument('--no_wandb', action='store_true')
     parser.add_argument('--wandb_project', type=str, default='act-pla-house1')
     parser.add_argument('--wandb_run_name', type=str, default=None)
     # action_dim is plumbed through args_override in build_ACT_model_and_optimizer,
@@ -77,9 +81,18 @@ def get_args_parser():
     # position embedding stays at (2, hidden_dim)).
     parser.add_argument('--n_proximity_sensors', type=int, default=0)
     # P+ACT: K tokens per sensor. K=1 (default) = original behaviour.
-    # K>1 expands each (3-D) prox position to K hidden_dim encoder tokens so the
+    # K>1 expands each prox feature into K hidden_dim encoder tokens so the
     # prox stream has total-token parity with the image stream (~160 image tokens).
     parser.add_argument('--prox_tokens_per_sensor', type=int, default=1)
+    # P+ACT: dimension of each proximity feature vector in proximity_positions.
+    # 3 = original predicted-3D-position fusion; 256 = Safety-CVAE decoder-trunk
+    # feature; 7 = CVAE retreat-delta. Plumbed through args_override (policy_config),
+    # declared here so the re-parse in build_ACT_model_and_optimizer accepts it.
+    parser.add_argument('--prox_feat_dim', type=int, default=3)
+    # P+ACT: which frozen Safety-CVAE feature to inject ('trunk' 256-d or 'delta' 7-d).
+    # Consumed by imitate_episodes.py to build the extractor; a no-op here.
+    parser.add_argument('--prox_feature', type=str, default='trunk',
+                        choices=('trunk', 'delta', 'raw'))
     # P+ACT: trainer-side flags consumed by `pact.act_prox.imitate_episodes_with_prox`.
     # ACT's internal argparse must accept them here (as no-ops) so they don't
     # error out when the trainer constructs the policy.
@@ -87,6 +100,19 @@ def get_args_parser():
     parser.add_argument('--prox_encoder_ckpt', type=str, default=None)
     parser.add_argument('--prox_mapping_json', type=str, default=None)
     parser.add_argument('--num_workers', type=int, default=1)
+    # FACTR visual-curriculum flags consumed by imitate_episodes.py; declared here
+    # as no-ops so the sys.argv re-parse in build_*_model_and_optimizer accepts them.
+    parser.add_argument('--blur_sigma0', type=float, default=0.0)
+    parser.add_argument('--blur_curriculum_steps', type=int, default=None)
+    parser.add_argument('--blur_mode', type=str, default='curriculum',
+                        choices=('curriculum', 'constant'))
+    # Modality-dropout flags consumed by imitate_episodes.py; declared here as
+    # no-ops so the sys.argv re-parse in build_*_model_and_optimizer accepts them.
+    parser.add_argument('--image_dropout_p', type=float, default=0.0)
+    parser.add_argument('--prox_dropout_p', type=float, default=0.0)
+    parser.add_argument('--image_dropout_mode', type=str, default='all',
+                        choices=('all', 'single'))
+    parser.add_argument('--no_zero_latent_on_drop', action='store_true')
 
     return parser
 

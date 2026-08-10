@@ -2,7 +2,9 @@ import torch
 import numpy as np
 import os
 import datetime
+import math
 import pickle
+import json
 import argparse
 import matplotlib.pyplot as plt
 from copy import deepcopy
@@ -64,7 +66,7 @@ def main(args):
         action_dim = state_dim
     elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random',
                        'pla_house3_mug_random', 'pla_houses_1_3_mug_random',
-                       'obstacle_baseline'):
+                       'obstacle_baseline', 'obstacle_pact', 'obstacle_pact_v2'):
         # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
         state_dim = 9
         action_dim = 8
@@ -98,6 +100,38 @@ def main(args):
     else:
         raise NotImplementedError
 
+    # P+ACT (PACT): load the frozen Safety-CVAE skin feature extractor and switch on
+    # the proximity conditioning tokens. The extractor maps the live 40x8x8 skin depth
+    # to a feature (256-d decoder trunk, or 7-d retreat delta) that becomes K extra
+    # ACT encoder tokens. The CVAE is frozen — only the ACT-side projection + extra
+    # positional embeddings learn. With --use_proximity OFF the model is bit-identical
+    # to vanilla ACT (n_proximity_sensors stays 0).
+    use_proximity = args.get('use_proximity', False)
+    prox_encoder = None
+    prox_cfg_json = None
+    if use_proximity:
+        if policy_class != 'ACT':
+            raise NotImplementedError('proximity fusion is only implemented for ACT')
+        import prox_cvae
+        prox_ckpt = args.get('prox_encoder_ckpt') or prox_cvae.DEFAULT_CKPT
+        prox_feature = args.get('prox_feature') or 'trunk'
+        prox_K = int(args.get('prox_tokens_per_sensor') or 8)
+        prox_encoder = prox_cvae.ProxCVAEEncoder(prox_ckpt, feature=prox_feature, device='cuda')
+        policy_config['n_proximity_sensors'] = 1
+        policy_config['prox_tokens_per_sensor'] = prox_K
+        policy_config['prox_feat_dim'] = prox_encoder.feat_dim
+        prox_cfg_json = {
+            'use_proximity': True,
+            'prox_encoder_ckpt': str(prox_ckpt),
+            'prox_feature': prox_feature,
+            'prox_tokens_per_sensor': prox_K,
+            'prox_feat_dim': prox_encoder.feat_dim,
+            'n_proximity_sensors': 1,
+            'sensor_order': prox_encoder.sensor_order,
+        }
+        print(f"[P+ACT] proximity fusion ON: feature={prox_feature} "
+              f"feat_dim={prox_encoder.feat_dim} K={prox_K} ckpt={prox_ckpt}")
+
     # wandb: log by default (opt out with --no_wandb). Run name auto-built as
     # taskname_numepochs_chunk_lr_seed unless --wandb_run_name is given.
     use_wandb = not args.get('no_wandb', False)
@@ -130,6 +164,16 @@ def main(args):
         'use_wandb': use_wandb,
         'wandb_project': args.get('wandb_project', 'act-obstacle-baseline'),
         'wandb_run_name': wandb_run_name,
+        'use_proximity': use_proximity,
+        'prox_encoder': prox_encoder,
+        'prox_feature': (args.get('prox_feature') or 'trunk') if use_proximity else None,
+        'blur_sigma0': args.get('blur_sigma0') or 0.0,
+        'blur_curriculum_steps': args.get('blur_curriculum_steps'),
+        'blur_mode': args.get('blur_mode') or 'curriculum',
+        'image_dropout_p': args.get('image_dropout_p') or 0.0,
+        'prox_dropout_p': args.get('prox_dropout_p') or 0.0,
+        'image_dropout_mode': args.get('image_dropout_mode') or 'all',
+        'zero_latent_on_drop': not args.get('no_zero_latent_on_drop', False),
     }
 
     if is_eval:
@@ -144,7 +188,9 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, args['chunk_size'])
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+        args['chunk_size'], load_proximity=use_proximity)
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -152,6 +198,12 @@ def main(args):
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
+
+    # P+ACT: persist the proximity fusion config so eval_act_obstacle.py can rebuild
+    # the exact same extractor + token layout without re-specifying every flag.
+    if prox_cfg_json is not None:
+        with open(os.path.join(ckpt_dir, 'prox_config.json'), 'w') as f:
+            json.dump(prox_cfg_json, f, indent=2)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
@@ -357,9 +409,94 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
-def forward_pass(data, policy):
+def blur_images(image_data, sigma):
+    """FACTR visual curriculum: Gaussian-blur a (B, num_cam, C, H, W) 0-1 image batch.
+
+    Training batches only — validation and eval always see sharp frames. Blurring
+    the 0-1 tensor is equivalent to blurring after the ImageNet normalization inside
+    the policy (the blur commutes with a per-channel affine).
+    """
+    if sigma < 0.1:
+        return image_data
+    from torchvision.transforms.functional import gaussian_blur
+    b, k, c, h, w = image_data.shape
+    kernel = 2 * math.ceil(3 * sigma) + 1
+    flat = image_data.reshape(b * k, c, h, w)
+    return gaussian_blur(flat, kernel_size=kernel, sigma=sigma).reshape(b, k, c, h, w)
+
+
+# The ImageNet mean maps to exactly zero after the Normalize inside ACTPolicy,
+# so a mean-filled frame is the least-OOD constant input for the frozen-BN ResNet.
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+
+
+def dropout_modalities(image_data, image_dropout_p, prox_dropout_p, mode='all'):
+    """Modality dropout: per-sample hard dropout of vision and/or proximity.
+
+    Samples independent per-sample Bernoulli masks over the batch dim of a
+    (B, num_cam, C, H, W) 0-1 image batch. Vision-dropped samples are filled
+    with the ImageNet mean (-> exactly-zero input post-normalize); mode='all'
+    fills every camera, mode='single' fills one randomly chosen camera per
+    dropped sample. The prox mask is sampled disjointly from the image mask so
+    no sample is ever blind on both modalities (the caller zeroes the prox
+    feature rows). Training batches only — validation and eval stay clean.
+
+    Returns (image_data, img_mask, prox_mask) with (B,) bool masks.
+    """
+    b, num_cam = image_data.shape[:2]
+    device = image_data.device
+    img_mask = torch.rand(b, device=device) < image_dropout_p
+    prox_mask = (torch.rand(b, device=device) < prox_dropout_p) & ~img_mask
+    if img_mask.any():
+        fill = IMAGENET_MEAN.to(device=device, dtype=image_data.dtype).view(1, 3, 1, 1)
+        if mode == 'all':
+            image_data[img_mask] = fill.unsqueeze(0)  # broadcast over num_cam
+        elif mode == 'single':
+            dropped_idx = torch.nonzero(img_mask, as_tuple=False).squeeze(1)
+            cam_idx = torch.randint(num_cam, (dropped_idx.numel(),), device=device)
+            image_data[dropped_idx, cam_idx] = fill
+        else:
+            raise ValueError(f"unknown image_dropout_mode {mode!r}")
+    return image_data, img_mask, prox_mask
+
+
+def forward_pass(data, policy, prox_encoder=None, blur_sigma=0.0,
+                 image_dropout_p=0.0, prox_dropout_p=0.0, dropout_mode='all',
+                 zero_latent_on_drop=True):
+    if len(data) == 5:
+        # P+ACT: 5th element is raw (B, 40, 8, 8) proximity depths. The frozen
+        # extractor turns it into the (B, 1, feat_dim) conditioning feature.
+        image_data, qpos_data, action_data, is_pad, prox_data = data
+        image_data, qpos_data, action_data, is_pad, prox_data = (
+            image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda(), prox_data.cuda())
+        image_data = blur_images(image_data, blur_sigma)
+        # Modality dropout AFTER the blur so the curriculum math stays untouched
+        # (blur of a constant fill would be the constant anyway).
+        img_mask = prox_mask = None
+        if image_dropout_p > 0 or prox_dropout_p > 0:
+            image_data, img_mask, prox_mask = dropout_modalities(
+                image_data, image_dropout_p, prox_dropout_p, dropout_mode)
+        proximity_positions = prox_encoder(prox_data) if prox_encoder is not None else None
+        if proximity_positions is not None and prox_mask is not None:
+            # Zero the dropped prox rows; the tensor stays not-None, keeping
+            # DETRVAE's n_proximity_sensors > 0 contract intact.
+            proximity_positions = proximity_positions.masked_fill(
+                prox_mask.view(-1, 1, 1), 0.0)
+        return policy(qpos_data, image_data, action_data, is_pad,
+                      proximity_positions=proximity_positions,
+                      image_dropped=img_mask if zero_latent_on_drop else None)
     image_data, qpos_data, action_data, is_pad = data
     image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
+    image_data = blur_images(image_data, blur_sigma)
+    # Vanilla branch: image dropout only, so a vanilla+dropout control arm trains.
+    img_mask = None
+    if image_dropout_p > 0:
+        image_data, img_mask, _ = dropout_modalities(
+            image_data, image_dropout_p, 0.0, dropout_mode)
+    if img_mask is not None and zero_latent_on_drop:
+        # Only ACTPolicy accepts image_dropped; dropout with CNNMLP is unsupported.
+        return policy(qpos_data, image_data, action_data, is_pad,
+                      image_dropped=img_mask)
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
@@ -388,6 +525,12 @@ def train_bc(train_dataloader, val_dataloader, config):
                 'state_dim': config['state_dim'],
                 'action_dim': config['action_dim'],
                 'camera_names': config['camera_names'],
+                'blur_sigma0': config.get('blur_sigma0', 0.0),
+                'blur_curriculum_steps': config.get('blur_curriculum_steps'),
+                'image_dropout_p': config.get('image_dropout_p', 0.0),
+                'prox_dropout_p': config.get('prox_dropout_p', 0.0),
+                'image_dropout_mode': config.get('image_dropout_mode', 'all'),
+                'zero_latent_on_drop': config.get('zero_latent_on_drop', True),
                 **{k: v for k, v in policy_config.items() if isinstance(v, (int, float, str, list, tuple, bool))},
             },
         )
@@ -397,6 +540,42 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
+    # P+ACT: frozen Safety-CVAE feature extractor (None for vanilla ACT). Passed into
+    # forward_pass to turn raw skin depths into the proximity conditioning feature.
+    prox_encoder = config.get('prox_encoder')
+    if prox_encoder is not None:
+        prox_encoder.eval()
+
+    # FACTR visual curriculum: blur_sigma_n = sigma0 * (1 - n/N) at global training
+    # step n; images start strongly blurred and sharpen linearly, forcing the policy
+    # to lean on non-visual tokens (qpos, proximity) early. sigma0=0 disables it.
+    blur_sigma0 = float(config.get('blur_sigma0') or 0.0)
+    blur_mode = config.get('blur_mode') or 'curriculum'
+    steps_per_epoch = max(1, len(train_dataloader))
+    blur_total_steps = int(config.get('blur_curriculum_steps') or
+                           max(1, (num_epochs * steps_per_epoch) // 2))
+    if blur_sigma0 > 0:
+        if blur_mode == 'constant':
+            print(f"[blur] CONSTANT blur ON: sigma={blur_sigma0} on every training frame "
+                  f"(no anneal); validation/eval stay sharp.")
+        else:
+            print(f"[FACTR] blur curriculum ON: sigma0={blur_sigma0} "
+                  f"annealed to 0 over N={blur_total_steps} steps "
+                  f"({steps_per_epoch} steps/epoch)")
+    global_step = 0
+    blur_sigma = 0.0
+
+    # Modality dropout: per-sample vision/prox dropout on TRAINING batches only
+    # (applied after the blur). Constant p throughout — annealing to 0 would
+    # restore the vision+qpos redundancy exactly when the best-val ckpt is picked.
+    image_dropout_p = float(config.get('image_dropout_p') or 0.0)
+    prox_dropout_p = float(config.get('prox_dropout_p') or 0.0)
+    dropout_mode = config.get('image_dropout_mode') or 'all'
+    zero_latent_on_drop = config.get('zero_latent_on_drop', True)
+    if image_dropout_p > 0 or prox_dropout_p > 0:
+        print(f"[dropout] modality dropout ON: p_img={image_dropout_p} "
+              f"p_prox={prox_dropout_p} mode={dropout_mode} "
+              f"zero_latent_on_drop={zero_latent_on_drop}")
 
     train_history = []
     validation_history = []
@@ -409,7 +588,7 @@ def train_bc(train_dataloader, val_dataloader, config):
             policy.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy)
+                forward_dict = forward_pass(data, policy, prox_encoder)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
@@ -428,7 +607,16 @@ def train_bc(train_dataloader, val_dataloader, config):
         policy.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
-            forward_dict = forward_pass(data, policy)
+            if blur_mode == 'constant':
+                blur_sigma = blur_sigma0
+            else:
+                blur_sigma = blur_sigma0 * max(0.0, 1.0 - global_step / blur_total_steps)
+            global_step += 1
+            forward_dict = forward_pass(data, policy, prox_encoder, blur_sigma=blur_sigma,
+                                        image_dropout_p=image_dropout_p,
+                                        prox_dropout_p=prox_dropout_p,
+                                        dropout_mode=dropout_mode,
+                                        zero_latent_on_drop=zero_latent_on_drop)
             # backward
             loss = forward_dict['loss']
             loss.backward()
@@ -445,6 +633,8 @@ def train_bc(train_dataloader, val_dataloader, config):
 
         if use_wandb:
             log_dict = {'epoch': epoch, 'min_val_loss': float(min_val_loss)}
+            if blur_sigma0 > 0:
+                log_dict['train/blur_sigma'] = float(blur_sigma)
             for k, v in epoch_summary.items():
                 log_dict[f'train/{k}'] = float(v.item())
             for k, v in validation_history[-1].items():
@@ -476,9 +666,12 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plot_path = os.path.join(ckpt_dir, f'train_val_{key}_seed_{seed}.png')
         plt.figure()
         train_values = [summary[key].item() for summary in train_history]
-        val_values = [summary[key].item() for summary in validation_history]
+        # dropout diagnostics (l1_img_dropped/l1_clean) exist only in training
+        # summaries (validation always runs clean) — plot what each side has.
+        val_values = [summary[key].item() for summary in validation_history if key in summary]
         plt.plot(np.linspace(0, num_epochs-1, len(train_history)), train_values, label='train')
-        plt.plot(np.linspace(0, num_epochs-1, len(validation_history)), val_values, label='validation')
+        if val_values:
+            plt.plot(np.linspace(0, num_epochs-1, len(val_values)), val_values, label='validation')
         # plt.ylim([-0.1, 1])
         plt.tight_layout()
         plt.legend()
@@ -506,6 +699,62 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+
+    # P+ACT (PACT): proximity-CVAE fusion. OFF by default -> vanilla ACT.
+    parser.add_argument('--use_proximity', action='store_true',
+                        help='Fuse the frozen Safety-CVAE skin feature into ACT as extra '
+                             'encoder tokens (PACT). Requires the obstacle_pact task data.')
+    parser.add_argument('--prox_encoder_ckpt', type=str, default=None,
+                        help='Safety-CVAE checkpoint dir (default: assets/safety/cvae_v3).')
+    parser.add_argument('--prox_feature', type=str, default='trunk',
+                        choices=('trunk', 'delta', 'raw'),
+                        help="Which skin feature to inject: 'trunk' (256-d frozen-CVAE "
+                             "decoder hidden), 'delta' (7-d retreat vector), or 'raw' "
+                             "(40-d per-sensor peak closeness, no CVAE — the v2 probes "
+                             "scored raw >= trunk on every label).")
+    parser.add_argument('--prox_tokens_per_sensor', type=int, default=8,
+                        help='K encoder tokens to expand the single skin feature into.')
+
+    # FACTR-style visual curriculum: Gaussian-blur ALL camera images at TRAINING
+    # time with sigma_n = sigma0 * (1 - n/N) at global train step n. Strong blur
+    # early forces the policy onto non-visual tokens (qpos, proximity); the blur
+    # anneals away by step N. Validation and eval always see sharp frames.
+    parser.add_argument('--blur_sigma0', type=float, default=0.0,
+                        help='Initial Gaussian blur sigma (pixels) for the FACTR visual '
+                             'curriculum. 0 (default) disables it. FACTR uses 8.')
+    parser.add_argument('--blur_curriculum_steps', type=int, default=None,
+                        help='N: number of training steps to linearly anneal the blur to '
+                             'zero over. Default: half of the total training steps. '
+                             '(Ignored when --blur_mode constant.)')
+    parser.add_argument('--blur_mode', type=str, default='curriculum',
+                        choices=('curriculum', 'constant'),
+                        help="'curriculum' (default, FACTR): blur anneals sigma0 -> 0 over N "
+                             "steps. 'constant': hold sigma0 on EVERY training frame for the "
+                             "whole run (no anneal) -> a fixed-blur degraded-vision training "
+                             "handicap. Validation/eval stay sharp in both modes.")
+
+    # Modality dropout (training only, applied AFTER the blur): per-sample hard
+    # dropout of the vision modality (fill with the ImageNet mean -> exactly-zero
+    # post-normalize input) so on dropped samples the L1 loss can only be reduced
+    # through the qpos + proximity tokens; plus low-p prox dropout, sampled
+    # disjointly, to keep vision sufficient too. Constant p all training (no
+    # anneal). Validation and eval always see clean inputs.
+    parser.add_argument('--image_dropout_p', type=float, default=0.0,
+                        help='Per-sample probability of dropping the vision modality '
+                             'at training time (mean-filled frames). 0 (default) '
+                             'disables it; the recommended arm uses 0.3.')
+    parser.add_argument('--prox_dropout_p', type=float, default=0.0,
+                        help='Per-sample probability of zeroing the proximity feature '
+                             'at training time. Disjoint from image dropout so no '
+                             'sample is ever blind on both. Recommended 0.1.')
+    parser.add_argument('--image_dropout_mode', type=str, default='all',
+                        choices=('all', 'single'),
+                        help="'all' mean-fills every camera of a dropped sample; "
+                             "'single' fills exactly one randomly chosen camera.")
+    parser.add_argument('--no_zero_latent_on_drop', action='store_true',
+                        help='Ablation: do NOT zero the CVAE style latent z on vision-'
+                             'dropped samples (leaves the action-chunk z-leakage path '
+                             'open and disables the split-L1 diagnostics).')
 
     # wandb — on by default; opt out with --no_wandb. Run name auto-built as
     # taskname_numepochs_chunk_lr_seed unless --wandb_run_name overrides it.

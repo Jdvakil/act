@@ -103,6 +103,33 @@ TASK_CONFIGS = {
         'episode_len': 169,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
+    'obstacle_pact': {
+        # SAME obstacle pick as obstacle_baseline, but the dataset ALSO carries
+        # /observations/proximity (T,40,8,8) so it can train BOTH arms of the PACT
+        # comparison: vanilla ACT (ignores proximity) and P+ACT (--use_proximity).
+        # Source = scripts/convert_obstacle_to_act.py --with_proximity over the same
+        # hybrid_obstacle_v1 20260612_183855 run. qpos=9, action=8.
+        # NOTE: set num_episodes / episode_len to whatever the converter printed
+        # (same source as obstacle_baseline -> expect ~100 / ~169).
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/obstacle_prox_v1',
+        'num_episodes': 100,
+        'episode_len': 168,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'obstacle_pact_v2': {
+        # INVISIBLE-BAR collection (causal forcing): hazard bar hidden from every RGB
+        # camera (MuJoCo geom group 4) but visible to the skin depth renderer and fully
+        # present in physics. Cells: visible-bar / invisible-bar / free at 0.375 / 0.375 /
+        # 0.25 (OBSTACLE_P=0.75, INVIS_P=0.5); object placement decoupled from bar
+        # presence so vision carries NO bar cue in the invisible cell. Source =
+        # scripts/convert_obstacle_to_act.py --with_proximity over
+        # hybrid_invis_obstacle_v1 20260703_095653 (5 of 8 houses survived an OOM;
+        # 105 successful episodes). Converter reported num_episodes=105, episode_len=185.
+        'dataset_dir': '/home/jaydv/code/prox_learning/act_style_data/obstacle_prox_v2',
+        'num_episodes': 105,
+        'episode_len': 185,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants

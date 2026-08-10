@@ -15,7 +15,12 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override['kl_weight']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, proximity_positions=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, proximity_positions=None,
+                 image_dropped=None):
+        # image_dropped: optional (B,) bool mask from modality dropout marking the
+        # vision-dropped samples. Forwarded to the model (which zeroes the CVAE
+        # style latent z for those samples) and used for detached split-L1
+        # diagnostics. Always None at inference time.
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -27,6 +32,7 @@ class ACTPolicy(nn.Module):
             a_hat, is_pad_hat, (mu, logvar) = self.model(
                 qpos, image, env_state, actions, is_pad,
                 proximity_positions=proximity_positions,
+                image_dropped=image_dropped,
             )
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
@@ -35,11 +41,24 @@ class ACTPolicy(nn.Module):
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+            if image_dropped is not None:
+                # Modality-dropout diagnostics: detached per-sample L1 split by the
+                # vision-dropout mask. Pure telemetry — the total loss is unchanged.
+                # An empty group (a batch that dropped nothing / everything) falls
+                # back to the overall mean so both keys always exist and epoch
+                # averaging (compute_dict_mean) never hits a missing key.
+                per_sample_l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean(dim=(1, 2)).detach()
+                overall = per_sample_l1.mean()
+                loss_dict['l1_img_dropped'] = (
+                    per_sample_l1[image_dropped].mean() if image_dropped.any() else overall)
+                loss_dict['l1_clean'] = (
+                    per_sample_l1[~image_dropped].mean() if (~image_dropped).any() else overall)
             return loss_dict
         else: # inference time
             a_hat, _, (_, _) = self.model(
                 qpos, image, env_state,
                 proximity_positions=proximity_positions,
+                image_dropped=image_dropped,
             ) # no action, sample from prior
             return a_hat
 

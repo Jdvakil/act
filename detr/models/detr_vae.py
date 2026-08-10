@@ -37,7 +37,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names,
-                 action_dim=None, n_proximity_sensors=0, prox_tokens_per_sensor=1):
+                 action_dim=None, n_proximity_sensors=0, prox_tokens_per_sensor=1,
+                 prox_feat_dim=3):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -49,14 +50,21 @@ class DETRVAE(nn.Module):
                 but may differ — e.g. Franka skin tasks have qpos=9 (arm7+2 fingers) and
                 action=8 (arm7+gripper_cmd1).
             n_proximity_sensors: when > 0, the model expects an extra
-                `proximity_positions` argument of shape (B, n_proximity_sensors, 3)
-                in `forward` and projects+concatenates one extra encoder token
-                per sensor. Default 0 keeps the model bit-identical to vanilla ACT.
-            prox_tokens_per_sensor: K. Each of the `n_proximity_sensors` 3-D
-                positions is expanded into K encoder tokens (default 1, the
+                `proximity_positions` argument of shape
+                (B, n_proximity_sensors, prox_feat_dim) in `forward` and
+                projects+concatenates extra encoder tokens. Default 0 keeps the
+                model bit-identical to vanilla ACT. For the P+ACT CVAE-feature
+                fusion this is 1 (a single global skin feature).
+            prox_tokens_per_sensor: K. Each of the `n_proximity_sensors`
+                feature vectors is expanded into K encoder tokens (default 1, the
                 original behaviour). K>1 gives prox total token-count parity with
                 image features so cross-attention mass is comparable across
                 modalities.
+            prox_feat_dim: dimension of each proximity feature vector fed in
+                `proximity_positions`. 3 (default) is the original predicted-3D-
+                position fusion; 256 is the Safety-CVAE decoder-trunk feature;
+                7 is the CVAE retreat-delta. Sets `input_proj_proximity`'s
+                in_features.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
@@ -70,6 +78,7 @@ class DETRVAE(nn.Module):
         self.action_dim = action_dim
         self.n_proximity_sensors = int(n_proximity_sensors)
         self.prox_tokens_per_sensor = int(prox_tokens_per_sensor)
+        self.prox_feat_dim = int(prox_feat_dim)
         if self.prox_tokens_per_sensor < 1:
             raise ValueError(
                 f"prox_tokens_per_sensor must be >= 1, got {self.prox_tokens_per_sensor}"
@@ -104,26 +113,32 @@ class DETRVAE(nn.Module):
         n_prox_tokens = self.n_proximity_sensors * self.prox_tokens_per_sensor
         self.additional_pos_embed = nn.Embedding(2 + n_prox_tokens, hidden_dim)
         if self.n_proximity_sensors > 0:
-            # Per-sensor projection from 3-D position (metres) into K hidden_dim
-            # tokens. Shared across all sensors.
+            # Per-sensor projection from a prox_feat_dim feature vector into K
+            # hidden_dim tokens. Shared across all sensors.
             self.input_proj_proximity = nn.Linear(
-                3, self.prox_tokens_per_sensor * hidden_dim
+                self.prox_feat_dim, self.prox_tokens_per_sensor * hidden_dim
             )
         else:
             self.input_proj_proximity = None
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None,
-                proximity_positions=None):
+                proximity_positions=None, image_dropped=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
         env_state: None
         actions: batch, seq, action_dim
         proximity_positions: when self.n_proximity_sensors > 0, a tensor of
-            shape (batch, n_proximity_sensors, 3) holding the predicted 3-D
-            object position in each sensor's local frame (metres). When None
+            shape (batch, n_proximity_sensors, prox_feat_dim) holding the
+            proximity conditioning feature(s) — for P+ACT, the frozen
+            Safety-CVAE skin feature, shape (batch, 1, prox_feat_dim). When None
             and n_proximity_sensors == 0, the model is bit-identical to vanilla
             ACT.
+        image_dropped: optional (batch,) bool mask from modality dropout. On
+            True samples the sampled CVAE style latent z is zeroed (matching
+            the inference branch), so z — inferred from the ground-truth action
+            chunk at training time — cannot leak the answer when the image
+            tokens carry nothing. None (default) changes nothing.
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
@@ -150,6 +165,14 @@ class DETRVAE(nn.Module):
             mu = latent_info[:, :self.latent_dim]
             logvar = latent_info[:, self.latent_dim:]
             latent_sample = reparametrize(mu, logvar)
+            if image_dropped is not None:
+                # Modality dropout: zero the style latent for vision-dropped
+                # samples. Zeroing latent_sample (not latent_input) reproduces
+                # the inference branch below exactly, latent_out_proj bias
+                # included. KL is still computed on all samples.
+                latent_sample = torch.where(image_dropped.unsqueeze(1),
+                                            torch.zeros_like(latent_sample),
+                                            latent_sample)
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
@@ -312,6 +335,7 @@ def build(args):
 
     n_proximity_sensors = int(getattr(args, "n_proximity_sensors", 0) or 0)
     prox_tokens_per_sensor = int(getattr(args, "prox_tokens_per_sensor", 1) or 1)
+    prox_feat_dim = int(getattr(args, "prox_feat_dim", 3) or 3)
 
     model = DETRVAE(
         backbones,
@@ -323,6 +347,7 @@ def build(args):
         action_dim=action_dim,
         n_proximity_sensors=n_proximity_sensors,
         prox_tokens_per_sensor=prox_tokens_per_sensor,
+        prox_feat_dim=prox_feat_dim,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
