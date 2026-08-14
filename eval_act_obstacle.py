@@ -229,6 +229,25 @@ class ACTInferencePolicy(InferencePolicy):
         image = np.transpose(image, (0, 3, 1, 2))
         image_t = torch.from_numpy(image).float().cuda().unsqueeze(0)
 
+        # Eval-time visual corruption. Blurs the camera frames the policy sees while
+        # leaving qpos and the 40-sensor skin depths untouched, which is the point: it
+        # degrades exactly one modality. Kernel and sigma convention match
+        # imitate_episodes.blur_images so a policy trained at constant sigma S and
+        # evaluated at --eval_blur_sigma S sees the same corruption both times.
+        # Applied on the 0-1 tensor, before ACTPolicy's ImageNet Normalize (the blur
+        # commutes with a per-channel affine). Default 0.0 = sharp = old behaviour.
+        if pc.eval_blur_sigma >= 0.1:
+            from torchvision.transforms.functional import gaussian_blur
+            _b, _k, _c, _h, _w = image_t.shape
+            _kernel = 2 * int(np.ceil(3 * pc.eval_blur_sigma)) + 1
+            image_t = gaussian_blur(
+                image_t.reshape(_b * _k, _c, _h, _w),
+                kernel_size=_kernel, sigma=float(pc.eval_blur_sigma),
+            ).reshape(_b, _k, _c, _h, _w)
+            if self._step == 0:
+                print(f"[act-eval] EVAL BLUR ON: sigma={pc.eval_blur_sigma} "
+                      f"kernel={_kernel} on {pc.camera_names} (skin/qpos untouched)")
+
         # P+ACT: stack the live 40-sensor skin depths (CVAE meta order) and run the frozen
         # extractor to get the conditioning feature. Raw meters -> extractor featurizes.
         proximity_positions = None
@@ -293,6 +312,9 @@ class ACTPolicyConfig(BasePolicyConfig):
     chunk_size: int = 100
     temp_agg_m: float = 0.01
     temp_agg_off: bool = False
+    # Gaussian blur sigma (pixels) applied to camera frames at EVAL time only.
+    # 0.0 = sharp. Independent of the training-time --blur_sigma0/--blur_mode.
+    eval_blur_sigma: float = 0.0
     kl_weight: int = 10
     hidden_dim: int = 512
     dim_feedforward: int = 3200
@@ -542,6 +564,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--image_w", type=int, default=320)
     p.add_argument("--temp_agg_off", action="store_true")
     p.add_argument("--temp_agg_m", type=float, default=0.01)
+    p.add_argument("--eval_blur_sigma", type=float, default=0.0,
+                   help="Gaussian blur sigma (pixels) applied to the camera frames at "
+                        "EVAL time. Corrupts vision only; the proximity skin and qpos "
+                        "are untouched. 0 = sharp. Use to sweep graceful degradation "
+                        "of a fixed checkpoint (paired: same weights, same seeds).")
     p.add_argument(
         "--end_on_collision", action="store_true",
         help="Strict-safety criterion: any arm<->obstacle collision counts as a FAILURE and "
@@ -639,6 +666,10 @@ def main() -> None:
     pc.image_h = args.image_h
     pc.image_w = args.image_w
     pc.temp_agg_off = args.temp_agg_off
+    pc.eval_blur_sigma = float(args.eval_blur_sigma)
+    if pc.eval_blur_sigma >= 0.1:
+        print(f"[act-eval] eval-time camera blur sigma={pc.eval_blur_sigma} "
+              f"(vision degraded, proximity + qpos untouched)")
     pc.temp_agg_m = args.temp_agg_m
 
     # P+ACT: a PACT checkpoint carries prox_config.json (written by imitate_episodes.py).
@@ -751,6 +782,7 @@ def main() -> None:
             "house_ind": args.house_ind,
             "task_horizon": args.task_horizon,
             "temp_agg_off": pc.temp_agg_off,
+            "eval_blur_sigma": pc.eval_blur_sigma,
             "end_on_collision": eval_cfg.end_on_collision,
             "use_proximity": pc.use_proximity,
             "success": int(success),
