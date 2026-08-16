@@ -43,10 +43,16 @@ TASK_CONFIGS = {
     'obstacle_baseline': {
         # VANILLA ACT BASELINE (rgb + qpos, NO proximity) on the one-env obstacle
         # pick: red cup in the fumehood, hazard bar present ~75% of episodes.
-        # Source = scripts/convert_obstacle_to_act.py over the hybrid_obstacle_v1
-        # 20260612_183855 run (5 houses x 25 trajs -> 100 successful episodes after
-        # dropping fail[-1] trajectories). qpos=9 (arm7 + 2 fingers), action=8
-        # (arm7 + 1 gripper cmd). Source episode T: median 84, max 167.
+        # 100 successful episodes (5 houses x 25 trajs, dropping fail[-1]
+        # trajectories). qpos=9 (arm7 + 2 fingers), action=8 (arm7 + 1 gripper cmd).
+        # Source episode T: median 84, max 167.
+        #
+        # NOT ON DISK -- deleted 2026-08-16 to reclaim space. The trained checkpoints
+        # under ckpts/act_obstacle_baseline_v1/ still exist, so published numbers are
+        # reproducible; you only need this dataset to retrain. Rebuild with:
+        #   python -m scripts.convert_obstacle_to_act \
+        #       --runs assets/datagen/hybrid_obstacle_v1/FrankaSkinHybridObstacleConfig/20260612_183855 \
+        #       --out act_style_data/obstacle_v1
         'dataset_dir': str(ACT_DATA_DIR / 'obstacle_v1'),
         'num_episodes': 100,
         'episode_len': 169,
@@ -56,8 +62,13 @@ TASK_CONFIGS = {
         # SAME obstacle pick as obstacle_baseline, but the dataset ALSO carries
         # /observations/proximity (T,40,8,8) so it can train BOTH arms of the PACT
         # comparison: vanilla ACT (ignores proximity) and P+ACT (--use_proximity).
-        # Source = scripts/convert_obstacle_to_act.py --with_proximity over the same
-        # hybrid_obstacle_v1 20260612_183855 run. qpos=9, action=8.
+        # qpos=9, action=8.
+        #
+        # NOT ON DISK -- deleted 2026-08-16 alongside obstacle_v1. Checkpoints under
+        # ckpts/obstacle_pact/ survive. Rebuild with:
+        #   python -m scripts.convert_obstacle_to_act --with_proximity \
+        #       --runs assets/datagen/hybrid_obstacle_v1/FrankaSkinHybridObstacleConfig/20260612_183855 \
+        #       --out act_style_data/obstacle_prox_v1
         'dataset_dir': str(ACT_DATA_DIR / 'obstacle_prox_v1'),
         'num_episodes': 100,
         'episode_len': 168,
