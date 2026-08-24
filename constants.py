@@ -89,16 +89,13 @@ TASK_CONFIGS = {
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
     'obstacle_pact_avoid_v1': {
-        # Collision-aware reconvert: drop inbound scrapes (keep deflect grazes),
-        # min-pool skin substeps, upsample real bows. Paste num_episodes /
-        # episode_len from convert_meta.json after:
-        #   python -m scripts.convert_obstacle_to_act --with_proximity --prox_pool min \
-        #       --skip_approach_collision --keep_deflect_collisions --upsample_deflect 3 \
-        #       --src assets/datagen/hybrid_invis_obstacle_v1/FrankaSkinHybridInvisObstacleConfig/20260703_095653 \
-        #       --dst act_style_data/obstacle_prox_avoid_v1
+        # Collision-aware reconvert of hybrid_obstacle_v1 20260612_183855
+        # (2026-08-23): drop inbound scrapes except deflect grazes, min-pool
+        # skin substeps, 3× upsample bows. 125 source trajs − 25 fail − 13
+        # non-deflect collisions = 87 unique (32 deflect × 3 + 55 free = 151).
         'dataset_dir': str(ACT_DATA_DIR / 'obstacle_prox_avoid_v1'),
-        'num_episodes': 0,
-        'episode_len': 185,
+        'num_episodes': 151,
+        'episode_len': 140,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
 }
