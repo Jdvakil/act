@@ -91,8 +91,11 @@ def get_args_parser():
     parser.add_argument('--prox_feat_dim', type=int, default=3)
     # P+ACT: which frozen Safety-CVAE feature to inject ('trunk' 256-d or 'delta' 7-d).
     # Consumed by imitate_episodes.py to build the extractor; a no-op here.
-    parser.add_argument('--prox_feature', type=str, default='trunk',
+    parser.add_argument('--prox_feature', type=str, default='raw',
                         choices=('trunk', 'delta', 'raw'))
+    parser.add_argument('--prox_layout', type=str, default='per_sensor',
+                        choices=('global', 'per_sensor'))
+    parser.add_argument('--prox_pool', type=str, default=None, choices=('mean', 'min'))
     # P+ACT: trainer-side flags consumed by `pact.act_prox.imitate_episodes_with_prox`.
     # ACT's internal argparse must accept them here (as no-ops) so they don't
     # error out when the trainer constructs the policy.

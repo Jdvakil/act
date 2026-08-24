@@ -171,10 +171,15 @@ class ACTInferencePolicy(InferencePolicy):
         # values come from the ckpt's prox_config.json (set in main), so train/eval match.
         if pc.use_proximity:
             ckpt = pc.prox_encoder_ckpt or prox_cvae.DEFAULT_CKPT
-            self._prox_encoder = ProxCVAEEncoder(ckpt, feature=pc.prox_feature, device="cuda")
-            policy_config["n_proximity_sensors"] = 1
-            policy_config["prox_tokens_per_sensor"] = int(pc.prox_tokens_per_sensor)
-            policy_config["prox_feat_dim"] = self._prox_encoder.feat_dim
+            self._prox_encoder = ProxCVAEEncoder(
+                ckpt, feature=pc.prox_feature, device="cuda",
+                layout=getattr(pc, "prox_layout", "global"),
+                tokens_per_sensor=int(pc.prox_tokens_per_sensor),
+            )
+            policy_config["n_proximity_sensors"] = self._prox_encoder.n_act_sensors
+            policy_config["prox_tokens_per_sensor"] = self._prox_encoder.tokens_per_sensor
+            policy_config["prox_feat_dim"] = self._prox_encoder.act_feat_dim
+            self._prox_pool = getattr(pc, "prox_pool", "mean")
         with _detr_argv(self.pc.ckpt_dir, self.pc.seed):
             policy = ACTPolicy(policy_config)
         sd = torch.load(self.ckpt_path, map_location="cuda")
@@ -252,7 +257,9 @@ class ACTInferencePolicy(InferencePolicy):
         # extractor to get the conditioning feature. Raw meters -> extractor featurizes.
         proximity_positions = None
         if self._prox_encoder is not None:
-            prox_np = stack_obs_proximity(obs, self._prox_encoder.sensor_order)  # (40,8,8)
+            prox_np = stack_obs_proximity(
+                obs, self._prox_encoder.sensor_order, pool=getattr(self, "_prox_pool", "mean")
+            )  # (40,8,8)
             if self._step == 0:
                 print(f"[act-eval] proximity ON | {prox_np.shape} "
                       f"min={prox_np.min():.3f}m max={prox_np.max():.3f}m")
@@ -332,7 +339,9 @@ class ACTPolicyConfig(BasePolicyConfig):
     # prox_config.json; vanilla ckpts have no such file -> use_proximity stays False.
     use_proximity: bool = False
     prox_encoder_ckpt: str = ""
-    prox_feature: str = "trunk"
+    prox_feature: str = "raw"
+    prox_layout: str = "global"
+    prox_pool: str = "mean"
     prox_tokens_per_sensor: int = 8
 
 
@@ -681,17 +690,23 @@ def main() -> None:
         pcfg = json.loads(prox_cfg_path.read_text())
         pc.use_proximity = True
         pc.prox_feature = pcfg.get("prox_feature", "trunk")
+        pc.prox_layout = pcfg.get("prox_layout", "global")
+        pc.prox_pool = pcfg.get("prox_pool", "mean")
         pc.prox_tokens_per_sensor = int(pcfg.get("prox_tokens_per_sensor", 8))
         pc.prox_encoder_ckpt = args.prox_encoder_ckpt or pcfg.get("prox_encoder_ckpt", "")
         print(f"[act-eval] PACT ckpt detected -> proximity ON "
-              f"(feature={pc.prox_feature}, K={pc.prox_tokens_per_sensor})")
+              f"(feature={pc.prox_feature}, layout={pc.prox_layout}, "
+              f"K={pc.prox_tokens_per_sensor}, pool={pc.prox_pool})")
     elif args.use_proximity:
         pc.use_proximity = True
         pc.prox_feature = args.prox_feature
+        pc.prox_layout = getattr(args, "prox_layout", "global")
+        pc.prox_pool = getattr(args, "prox_pool", None) or "mean"
         pc.prox_tokens_per_sensor = args.prox_tokens_per_sensor
         pc.prox_encoder_ckpt = args.prox_encoder_ckpt
         print(f"[act-eval] proximity FORCED ON via CLI "
-              f"(feature={pc.prox_feature}, K={pc.prox_tokens_per_sensor})")
+              f"(feature={pc.prox_feature}, layout={pc.prox_layout}, "
+              f"K={pc.prox_tokens_per_sensor})")
 
     eval_cfg.save_config()
     print(f"[act-eval] writing rollouts to {eval_cfg.output_dir}")

@@ -66,7 +66,8 @@ def main(args):
         action_dim = state_dim
     elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random',
                        'pla_house3_mug_random', 'pla_houses_1_3_mug_random',
-                       'obstacle_baseline', 'obstacle_pact', 'obstacle_pact_v2'):
+                       'obstacle_baseline', 'obstacle_pact', 'obstacle_pact_v2',
+                       'obstacle_pact_avoid_v1'):
         # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
         state_dim = 9
         action_dim = 8
@@ -107,6 +108,11 @@ def main(args):
     # positional embeddings learn. With --use_proximity OFF the model is bit-identical
     # to vanilla ACT (n_proximity_sensors stays 0).
     use_proximity = args.get('use_proximity', False)
+    if is_eval and use_proximity:
+        raise SystemExit(
+            "[P+ACT] imitate_episodes.py --eval never feeds proximity_positions. "
+            "Use eval_act_obstacle.py --temp_agg_off. Refusing a fake PACT eval."
+        )
     prox_encoder = None
     prox_cfg_json = None
     if use_proximity:
@@ -114,23 +120,36 @@ def main(args):
             raise NotImplementedError('proximity fusion is only implemented for ACT')
         import prox_cvae
         prox_ckpt = args.get('prox_encoder_ckpt') or prox_cvae.DEFAULT_CKPT
-        prox_feature = args.get('prox_feature') or 'trunk'
+        prox_feature = args.get('prox_feature') or 'raw'
+        prox_layout = args.get('prox_layout') or 'per_sensor'
         prox_K = int(args.get('prox_tokens_per_sensor') or 8)
-        prox_encoder = prox_cvae.ProxCVAEEncoder(prox_ckpt, feature=prox_feature, device='cuda')
-        policy_config['n_proximity_sensors'] = 1
-        policy_config['prox_tokens_per_sensor'] = prox_K
-        policy_config['prox_feat_dim'] = prox_encoder.feat_dim
+        prox_encoder = prox_cvae.ProxCVAEEncoder(
+            prox_ckpt, feature=prox_feature, device='cuda',
+            layout=prox_layout, tokens_per_sensor=prox_K,
+        )
+        policy_config['n_proximity_sensors'] = prox_encoder.n_act_sensors
+        policy_config['prox_tokens_per_sensor'] = prox_encoder.tokens_per_sensor
+        policy_config['prox_feat_dim'] = prox_encoder.act_feat_dim
+        prox_pool = args.get('prox_pool')
+        meta_path = os.path.join(dataset_dir, 'convert_meta.json')
+        if not prox_pool:
+            prox_pool = 'mean'
+            if os.path.isfile(meta_path):
+                prox_pool = json.load(open(meta_path)).get('prox_pool', 'mean')
         prox_cfg_json = {
             'use_proximity': True,
             'prox_encoder_ckpt': str(prox_ckpt),
             'prox_feature': prox_feature,
-            'prox_tokens_per_sensor': prox_K,
-            'prox_feat_dim': prox_encoder.feat_dim,
-            'n_proximity_sensors': 1,
+            'prox_layout': prox_encoder.layout,
+            'prox_pool': prox_pool,
+            'prox_tokens_per_sensor': prox_encoder.tokens_per_sensor,
+            'prox_feat_dim': prox_encoder.act_feat_dim,
+            'n_proximity_sensors': prox_encoder.n_act_sensors,
             'sensor_order': prox_encoder.sensor_order,
         }
-        print(f"[P+ACT] proximity fusion ON: feature={prox_feature} "
-              f"feat_dim={prox_encoder.feat_dim} K={prox_K} ckpt={prox_ckpt}")
+        print(f"[P+ACT] proximity fusion ON: feature={prox_feature} layout={prox_encoder.layout} "
+              f"n_sensors={prox_encoder.n_act_sensors} feat_dim={prox_encoder.act_feat_dim} "
+              f"K={prox_encoder.tokens_per_sensor} pool={prox_pool} ckpt={prox_ckpt}")
 
     # wandb: log by default (opt out with --no_wandb). Run name auto-built as
     # taskname_numepochs_chunk_lr_seed unless --wandb_run_name is given.
@@ -166,7 +185,7 @@ def main(args):
         'wandb_run_name': wandb_run_name,
         'use_proximity': use_proximity,
         'prox_encoder': prox_encoder,
-        'prox_feature': (args.get('prox_feature') or 'trunk') if use_proximity else None,
+        'prox_feature': (args.get('prox_feature') or 'raw') if use_proximity else None,
         'blur_sigma0': args.get('blur_sigma0') or 0.0,
         'blur_curriculum_steps': args.get('blur_curriculum_steps'),
         'blur_mode': args.get('blur_mode') or 'curriculum',
@@ -706,12 +725,17 @@ if __name__ == '__main__':
                              'encoder tokens (PACT). Requires the obstacle_pact task data.')
     parser.add_argument('--prox_encoder_ckpt', type=str, default=None,
                         help='Safety-CVAE checkpoint dir (default: assets/safety/cvae_v3).')
-    parser.add_argument('--prox_feature', type=str, default='trunk',
+    parser.add_argument('--prox_feature', type=str, default='raw',
                         choices=('trunk', 'delta', 'raw'),
-                        help="Which skin feature to inject: 'trunk' (256-d frozen-CVAE "
-                             "decoder hidden), 'delta' (7-d retreat vector), or 'raw' "
-                             "(40-d per-sensor peak closeness, no CVAE — the v2 probes "
-                             "scored raw >= trunk on every label).")
+                        help="Which skin feature to inject: 'raw' (40-d peak closeness, "
+                             "the only tap that beat ACT), 'trunk' (256-d frozen-CVAE "
+                             "decoder hidden, negative control), or 'delta' (7-d retreat).")
+    parser.add_argument('--prox_layout', type=str, default='per_sensor',
+                        choices=('global', 'per_sensor'),
+                        help="'per_sensor' (default): 40 named tokens, K=1. "
+                             "'global': mash all sensors into one vector then K tokens.")
+    parser.add_argument('--prox_pool', type=str, default=None, choices=('mean', 'min'),
+                        help="Live substep pool. Default: convert_meta.json or mean.")
     parser.add_argument('--prox_tokens_per_sensor', type=int, default=8,
                         help='K encoder tokens to expand the single skin feature into.')
 

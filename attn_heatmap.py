@@ -68,10 +68,13 @@ def build_policy(ckpt_dir: Path, device: str = "cuda"):
     if pcfg:
         extractor = prox_cvae.ProxCVAEEncoder(
             pcfg.get("prox_encoder_ckpt") or prox_cvae.DEFAULT_CKPT,
-            feature=pcfg.get("prox_feature", "trunk"), device=device)
-        cfg["n_proximity_sensors"] = 1
-        cfg["prox_tokens_per_sensor"] = int(pcfg.get("prox_tokens_per_sensor", 8))
-        cfg["prox_feat_dim"] = extractor.feat_dim
+            feature=pcfg.get("prox_feature", "trunk"), device=device,
+            layout=pcfg.get("prox_layout", "global"),
+            tokens_per_sensor=int(pcfg.get("prox_tokens_per_sensor", 8)),
+        )
+        cfg["n_proximity_sensors"] = extractor.n_act_sensors
+        cfg["prox_tokens_per_sensor"] = extractor.tokens_per_sensor
+        cfg["prox_feat_dim"] = extractor.act_feat_dim
     with _detr_argv(ckpt_dir):
         policy = ACTPolicy(cfg)
     policy.load_state_dict(torch.load(ckpt_dir / "policy_best.ckpt", map_location=device))
