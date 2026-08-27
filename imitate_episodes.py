@@ -4,6 +4,7 @@ import os
 import pickle
 import argparse
 import matplotlib.pyplot as plt
+import wandb
 from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
@@ -41,7 +42,7 @@ def main(args):
     else:
         from constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
-    dataset_dir = "/home/qinzhengfangli/molmo_test/molmospaces/molmo-pick-dataset/data"
+    dataset_dir = "/home/qinzhengfangli/molmo_act_data/raw_h5"
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
@@ -89,8 +90,32 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'use_wandb': args.get('wandb', False),
+        'wandb_project': args.get('wandb_project', 'molmo-act'),
+        'wandb_run_name': args.get('wandb_run_name', None),
     }
+
+    if config['use_wandb'] and not is_eval:
+        wandb.init(
+            project=config['wandb_project'],
+            name=config['wandb_run_name'],
+            config={
+                'task_name': task_name,
+                'num_epochs': num_epochs,
+                'batch_size': batch_size_train,
+                'policy_class': policy_class,
+                'lr': args['lr'],
+                'kl_weight': args.get('kl_weight', None),
+                'chunk_size': args.get('chunk_size', None),
+                'hidden_dim': args.get('hidden_dim', None),
+                'dim_feedforward': args.get('dim_feedforward', None),
+                'camera_names': camera_names,
+                'state_dim': state_dim,
+                'dataset_dir': dataset_dir,
+                'num_episodes': num_episodes,
+            }
+        )
 
     if is_eval:
         ckpt_names = [f'policy_best.ckpt']
@@ -131,6 +156,22 @@ def main(args):
     ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+
+    if config.get('use_wandb', False):
+        wandb.log({
+            'best/epoch': best_epoch,
+            'best/val_loss': float(min_val_loss),
+        })
+        artifact = wandb.Artifact(
+            name=f"{config['wandb_run_name'] or 'act_run'}_checkpoints",
+            type='model'
+        )
+        for fname in ['policy_best.ckpt', 'policy_last.ckpt', 'dataset_stats.pkl']:
+            fpath = os.path.join(ckpt_dir, fname)
+            if os.path.exists(fpath):
+                artifact.add_file(fpath)
+        wandb.log_artifact(artifact)
+        wandb.finish()
 
 
 def make_policy(policy_class, policy_config):
@@ -373,6 +414,14 @@ def train_bc(train_dataloader, val_dataloader, config):
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
 
+        if config.get('use_wandb', False):
+            wandb.log({
+                'epoch': epoch,
+                'val/loss': epoch_val_loss.item(),
+                'val/l1': epoch_summary['l1'].item(),
+                'val/kl': epoch_summary['kl'].item(),
+            }, step=epoch)
+
         # training
         policy.train()
         optimizer.zero_grad()
@@ -391,6 +440,14 @@ def train_bc(train_dataloader, val_dataloader, config):
         for k, v in epoch_summary.items():
             summary_string += f'{k}: {v.item():.3f} '
         print(summary_string)
+
+        if config.get('use_wandb', False):
+            wandb.log({
+                'epoch': epoch,
+                'train/loss': epoch_train_loss.item(),
+                'train/l1': epoch_summary['l1'].item(),
+                'train/kl': epoch_summary['kl'].item(),
+            }, step=epoch)
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
@@ -446,5 +503,8 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+    parser.add_argument('--wandb', action='store_true')
+    parser.add_argument('--wandb_project', action='store', type=str, default='molmo-act')
+    parser.add_argument('--wandb_run_name', action='store', type=str, default=None)
     
     main(vars(parser.parse_args()))

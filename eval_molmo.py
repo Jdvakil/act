@@ -14,19 +14,19 @@ sys.path.append(MOLMO_ROOT)
 
 # ===== IMPORTS =====
 from detr.main import build_ACT_model
-from molmo_spaces.configs.base_pick_config import PickBaseConfig
+from molmo_spaces.evaluation.configs.evaluation_configs import DummyPickPlaceEvalConfig
 from molmo_spaces.configs.robot_configs import FrankaRobotConfig
-
+from molmo_spaces.configs.camera_configs import CameraSystemConfig
 # =========================
 # 1. MODEL
 # =========================
 class DummyArgs:
-    hidden_dim = 256
-    dim_feedforward = 1024
+    hidden_dim = 512
+    dim_feedforward = 3200
     enc_layers = 4
     dec_layers = 7
     nheads = 8
-    num_queries = 10
+    num_queries = 20
     backbone = "resnet18"
     lr_backbone = 1e-5
     masks = False
@@ -34,7 +34,7 @@ class DummyArgs:
     position_embedding = "sine"
     dropout = 0.1
     pre_norm = False
-    camera_names = ["main"]
+    camera_names = ["wrist"]
     state_dim = 9
 
 
@@ -43,7 +43,7 @@ def load_model():
     model = build_ACT_model(DummyArgs())
 
     print("Loading weights...")
-    state_dict = torch.load(f"{ACT_ROOT}/ckpt/policy_best.ckpt", map_location="cpu")
+    state_dict = torch.load(f"{ACT_ROOT}/ckpt_molmo_chunk20_bs64_100ep_gripperfix/policy_best.ckpt", map_location="cpu")
 
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -52,7 +52,7 @@ def load_model():
         else:
             new_state_dict[k] = v
 
-    model.load_state_dict(new_state_dict, strict=False)
+    model.load_state_dict(new_state_dict, strict=True)
     model.cuda()
     model.eval()
 
@@ -64,7 +64,12 @@ def load_model():
 # 2. SAMPLER (正确版本)
 # =========================
 def make_sampler():
-    config = PickBaseConfig()
+    config = DummyPickPlaceEvalConfig()
+    config.camera_config = CameraSystemConfig(
+        name="default",
+        img_resolution=(224,224)
+    )
+
     config.robot_config = FrankaRobotConfig()
     config.task_sampler_config.samples_per_house = 1
     config.task_sampler_config.house_inds = [0]   # 先用一个scene
@@ -74,39 +79,6 @@ def make_sampler():
     return sampler
 
 
-
-# =========================
-# 3. OBS PROCESSING
-# =========================
-def extract_obs(obs):
-    # Debug key
-    if isinstance(obs, dict):
-        # print("OBS KEYS:", obs.keys())
-
-        # image
-        if "image" in obs:
-            image = obs["image"]
-        elif "images" in obs:
-            if isinstance(obs["images"], dict):
-                image = list(obs["images"].values())[0]
-            else:
-                image = obs["images"]
-        else:
-            raise KeyError("No image key in obs")
-
-        # qpos
-        if "qpos" in obs:
-            qpos = obs["qpos"]
-        elif "state" in obs:
-            qpos = obs["state"]
-        elif "robot_state" in obs:
-            qpos = obs["robot_state"]
-        else:
-            raise KeyError("No qpos/state in obs")
-
-        return image, qpos
-
-    raise TypeError("Unknown obs type")
 
 
 def to_tensor(image_np, qpos_np):
@@ -138,8 +110,8 @@ def get_action(model, qpos, image):
     if isinstance(out, tuple):
         out = out[0]
 
-    action = out[:, 0, :]
-    return action.squeeze(0).cpu().numpy()
+    print("model out shape:", out.shape)
+    return out.action.squeeze(0).cpu().numpy()
 
 
 def check_success(info, reward):
@@ -165,38 +137,59 @@ def main():
     print("🔥 Running evaluation...")
 
     for ep in range(num_episodes):
+        success = False
+        step = 0
         print(f"\n===== Episode {ep} =====")
 
-        task = sampler.sample_task()
+        #task = sampler.sample_task()
+        max_tries = 20
+        task = None
+        for i in range(max_tries):
+            task = sampler.sample_task()
+            if task is not None:
+                break
+        print(f"retry {i+1}...")
+        if task is None:
+            print(" skip episode (sampling failed)")
+            continue
 
-        # 👇 关键（不同版本兼容）
-        if hasattr(task, "make_env"):
-            env = task.make_env()
-        elif hasattr(task, "env"):
-            env = task.env
-        else:
+
+
+
+
+        env = task.env
+        if env is None:
             raise RuntimeError("Cannot find env")
 
-        obs = env.reset()
+    # run episode
+        action_chunk = None
+        for t in range(max_steps):
 
-        done = False
-        reward = 0
-        info = {}
-        step = 0
+            #env.step(1)
+            if t % 20 == 0:
 
-        while not done and step < max_steps:
-            image_np, qpos_np = extract_obs(obs)
-            image, qpos = to_tensor(image_np, qpos_np)
+                image_np = env._renderer.render()
+                qpos_np = env.mj_datas[0].qpos.copy()
+                print("image shape:", image_np.shape)
+                image, qpos = to_tensor(image_np, qpos_np)
+                action_chunk = get_action_chunk(model, qpos, image)
 
-            action = get_action(model, qpos, image)
+            action = action_chunk[t%20]
+            action = action[:8]
+            env.mj_datas[0].ctrl[:] = action
+            env.step()
 
-            obs, reward, done, info = env.step(action)
+            try:
+                if env.is_success():
+                   success = True
+                   break
+            except:
+                  pass
 
             step += 1
 
-        success = check_success(info, reward)
-        success_count += int(success)
-
+        if success:
+            success_count +=1
         print(f"Episode {ep} | success={success} | steps={step}")
 
     print("\n🔥 SUCCESS RATE:", success_count / num_episodes)
