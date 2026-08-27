@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import sys
 import datetime
 import math
 import pickle
@@ -8,6 +9,7 @@ import json
 import argparse
 import matplotlib.pyplot as plt
 from copy import deepcopy
+from pathlib import Path
 from tqdm import tqdm
 from einops import rearrange
 
@@ -18,6 +20,10 @@ from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from sim_env import BOX_POSE
@@ -67,7 +73,8 @@ def main(args):
     elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random',
                        'pla_house3_mug_random', 'pla_houses_1_3_mug_random',
                        'obstacle_baseline', 'obstacle_pact', 'obstacle_pact_v2',
-                       'obstacle_pact_avoid_v1'):
+                       'obstacle_pact_avoid_v1', 'obstacle_gate_v1',
+                       'pact_place_corridor_v5'):
         # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
         state_dim = 9
         action_dim = 8
@@ -111,24 +118,46 @@ def main(args):
     if is_eval and use_proximity:
         raise SystemExit(
             "[P+ACT] imitate_episodes.py --eval never feeds proximity_positions. "
-            "Use eval_act_obstacle.py --temp_agg_off. Refusing a fake PACT eval."
+            "Use eval_act_obstacle.py --temp_agg_off (obstacle pick) or "
+            "eval_act_place_corridor.py --temp_agg_off (place-corridor). "
+            "Refusing a fake PACT eval."
         )
     prox_encoder = None
     prox_cfg_json = None
+    prox_layout_data = "raw"
     if use_proximity:
         if policy_class != 'ACT':
             raise NotImplementedError('proximity fusion is only implemented for ACT')
-        import prox_cvae
-        prox_ckpt = args.get('prox_encoder_ckpt') or prox_cvae.DEFAULT_CKPT
+        from encoders.pact import (
+            build_pact_encoder,
+            hdf5_proximity_layout,
+            is_geometry_feature,
+        )
         prox_feature = args.get('prox_feature') or 'raw'
+        prox_ckpt = args.get('prox_encoder_ckpt') or ''
+        if prox_feature in ('trunk', 'delta') and not prox_ckpt:
+            raise SystemExit(
+                '[P+ACT] trunk/delta need --prox_encoder_ckpt; CVAE weights were removed. '
+                'Use --prox_feature raw or a surface-geometry checkpoint.'
+            )
+        if is_geometry_feature(prox_feature) and not prox_ckpt:
+            print(
+                '[P+ACT] geometry encoder has NO checkpoint — untrained weights. '
+                'Pass --prox_encoder_ckpt with a frozen pact_surface_*_v1 file.'
+            )
         prox_layout = args.get('prox_layout') or 'per_sensor'
         prox_K = int(args.get('prox_tokens_per_sensor') or 8)
-        prox_encoder = prox_cvae.ProxCVAEEncoder(
-            prox_ckpt, feature=prox_feature, device='cuda',
-            layout=prox_layout, tokens_per_sensor=prox_K,
+        if is_geometry_feature(prox_feature) and prox_K == 8:
+            prox_K = 1
+        prox_encoder = build_pact_encoder(
+            prox_feature,
+            checkpoint=prox_ckpt or None,
+            device='cuda',
+            layout=prox_layout,
+            tokens_per_sensor=prox_K,
         )
         policy_config['n_proximity_sensors'] = prox_encoder.n_act_sensors
-        policy_config['prox_tokens_per_sensor'] = prox_encoder.tokens_per_sensor
+        policy_config['prox_tokens_per_sensor'] = prox_K
         policy_config['prox_feat_dim'] = prox_encoder.act_feat_dim
         prox_pool = args.get('prox_pool')
         meta_path = os.path.join(dataset_dir, 'convert_meta.json')
@@ -136,20 +165,24 @@ def main(args):
             prox_pool = 'mean'
             if os.path.isfile(meta_path):
                 prox_pool = json.load(open(meta_path)).get('prox_pool', 'mean')
+        prox_layout_data = hdf5_proximity_layout(dataset_dir, prox_feature)
+        train_encoder = None if prox_layout_data in ('embeddings', 'positions') else prox_encoder
         prox_cfg_json = {
             'use_proximity': True,
-            'prox_encoder_ckpt': str(prox_ckpt),
+            'prox_encoder_ckpt': str(prox_ckpt) if prox_ckpt else '',
             'prox_feature': prox_feature,
             'prox_layout': prox_encoder.layout,
             'prox_pool': prox_pool,
-            'prox_tokens_per_sensor': prox_encoder.tokens_per_sensor,
+            'prox_tokens_per_sensor': prox_K,
             'prox_feat_dim': prox_encoder.act_feat_dim,
             'n_proximity_sensors': prox_encoder.n_act_sensors,
             'sensor_order': prox_encoder.sensor_order,
+            'proximity_layout': prox_layout_data,
         }
         print(f"[P+ACT] proximity fusion ON: feature={prox_feature} layout={prox_encoder.layout} "
               f"n_sensors={prox_encoder.n_act_sensors} feat_dim={prox_encoder.act_feat_dim} "
-              f"K={prox_encoder.tokens_per_sensor} pool={prox_pool} ckpt={prox_ckpt}")
+              f"K={prox_K} pool={prox_pool} data={prox_layout_data} ckpt={prox_ckpt}")
+        prox_encoder = train_encoder
 
     # wandb: log by default (opt out with --no_wandb). Run name auto-built as
     # taskname_numepochs_chunk_lr_seed unless --wandb_run_name is given.
@@ -209,7 +242,11 @@ def main(args):
 
     train_dataloader, val_dataloader, stats, _ = load_data(
         dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-        args['chunk_size'], load_proximity=use_proximity)
+        args['chunk_size'], load_proximity=use_proximity,
+        proximity_layout=prox_layout_data,
+        n_proximity_sensors=policy_config.get('n_proximity_sensors', 0) if use_proximity else 0,
+        proximity_feature_dim=policy_config.get('prox_feat_dim', 3) if use_proximity else 3,
+    )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -495,7 +532,10 @@ def forward_pass(data, policy, prox_encoder=None, blur_sigma=0.0,
         if image_dropout_p > 0 or prox_dropout_p > 0:
             image_data, img_mask, prox_mask = dropout_modalities(
                 image_data, image_dropout_p, prox_dropout_p, dropout_mode)
-        proximity_positions = prox_encoder(prox_data) if prox_encoder is not None else None
+        proximity_positions = None
+        if prox_data is not None:
+            from encoders.pact import encode_for_act
+            proximity_positions = encode_for_act(prox_encoder, prox_data)
         if proximity_positions is not None and prox_mask is not None:
             # Zero the dropped prox rows; the tensor stays not-None, keeping
             # DETRVAE's n_proximity_sensors > 0 contract intact.
@@ -724,12 +764,17 @@ if __name__ == '__main__':
                         help='Fuse the frozen Safety-CVAE skin feature into ACT as extra '
                              'encoder tokens (PACT). Requires the obstacle_pact task data.')
     parser.add_argument('--prox_encoder_ckpt', type=str, default=None,
-                        help='Safety-CVAE checkpoint dir (default: assets/safety/cvae_v3).')
+                        help='Frozen encoder. CVAE dir for trunk/delta; '
+                             'pact_surface_*_v1.pt for nearest_surface / surface_embedding. '
+                             'raw needs none.')
     parser.add_argument('--prox_feature', type=str, default='raw',
-                        choices=('trunk', 'delta', 'raw'),
-                        help="Which skin feature to inject: 'raw' (40-d peak closeness, "
-                             "the only tap that beat ACT), 'trunk' (256-d frozen-CVAE "
-                             "decoder hidden, negative control), or 'delta' (7-d retreat).")
+                        choices=('trunk', 'delta', 'raw', 'peak_closeness',
+                                 'nearest_surface', 'surface_embedding',
+                                 'xyz', 'embedding'),
+                        help="Skin feature: 'raw'/'peak_closeness' (40-d peak closeness), "
+                             "'nearest_surface'/'xyz' (3-d local point), "
+                             "'surface_embedding'/'embedding' (32-d geometry), "
+                             "'trunk'/'delta' (deleted CVAE taps).")
     parser.add_argument('--prox_layout', type=str, default='per_sensor',
                         choices=('global', 'per_sensor'),
                         help="'per_sensor' (default): 40 named tokens, K=1. "

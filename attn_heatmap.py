@@ -36,7 +36,11 @@ import numpy as np
 import torch
 
 from policy import ACTPolicy
-import prox_cvae
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from encoders.pact import build_pact_encoder, is_geometry_feature
 
 CAM_NAMES = ("exo_camera_1", "wrist_camera")
 H_FEAT, W_FEAT = 8, 10          # resnet18 layer4 feature grid for a 240x320 image
@@ -66,14 +70,19 @@ def build_policy(ckpt_dir: Path, device: str = "cuda"):
                state_dim=9, action_dim=8)
     extractor = None
     if pcfg:
-        extractor = prox_cvae.ProxCVAEEncoder(
-            pcfg.get("prox_encoder_ckpt") or prox_cvae.DEFAULT_CKPT,
-            feature=pcfg.get("prox_feature", "trunk"), device=device,
+        k = int(pcfg.get("prox_tokens_per_sensor", 8))
+        feat = pcfg.get("prox_feature", "raw")
+        if is_geometry_feature(feat) and k == 8:
+            k = 1
+        extractor = build_pact_encoder(
+            feat,
+            checkpoint=pcfg.get("prox_encoder_ckpt") or None,
+            device=device,
             layout=pcfg.get("prox_layout", "global"),
-            tokens_per_sensor=int(pcfg.get("prox_tokens_per_sensor", 8)),
+            tokens_per_sensor=k,
         )
         cfg["n_proximity_sensors"] = extractor.n_act_sensors
-        cfg["prox_tokens_per_sensor"] = extractor.tokens_per_sensor
+        cfg["prox_tokens_per_sensor"] = k
         cfg["prox_feat_dim"] = extractor.act_feat_dim
     with _detr_argv(ckpt_dir):
         policy = ACTPolicy(cfg)

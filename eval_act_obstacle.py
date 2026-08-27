@@ -107,10 +107,13 @@ def _detr_argv(ckpt_dir: str, seed: int):
 
 
 # ACT-side imports (we live inside submodules/act/).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 from policy import ACTPolicy
 from utils import set_seed
-import prox_cvae
-from prox_cvae import ProxCVAEEncoder, stack_obs_proximity
+from prox_cvae import stack_obs_proximity
+from encoders.pact import build_pact_encoder, encode_for_act, is_geometry_feature
 
 # molmospaces imports — eval target env / policy framework.
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
@@ -139,7 +142,8 @@ class ACTInferencePolicy(InferencePolicy):
         self._pending_chunks: list[tuple[int, np.ndarray]] = []
         self._policy = None
         self._stats = None
-        self._prox_encoder = None  # P+ACT frozen Safety-CVAE feature extractor
+        self._prox_encoder = None  # P+ACT frozen skin encoder
+        self._prox_hist: list[np.ndarray] = []
 
     def reset(self) -> None:
         # Per-episode wandb logging (index, length, collisions) is owned by
@@ -148,6 +152,7 @@ class ACTInferencePolicy(InferencePolicy):
         # (pipeline setup_policy), so accumulating episode state here is unreliable.
         self._step = 0
         self._pending_chunks.clear()
+        self._prox_hist = []
 
     def prepare_model(self, model_name: str | None = None) -> None:
         pc = self.pc
@@ -170,14 +175,19 @@ class ACTInferencePolicy(InferencePolicy):
         # and switch on the proximity tokens (n_proximity_sensors=1, K, feat_dim). The
         # values come from the ckpt's prox_config.json (set in main), so train/eval match.
         if pc.use_proximity:
-            ckpt = pc.prox_encoder_ckpt or prox_cvae.DEFAULT_CKPT
-            self._prox_encoder = ProxCVAEEncoder(
-                ckpt, feature=pc.prox_feature, device="cuda",
-                layout=getattr(pc, "prox_layout", "global"),
-                tokens_per_sensor=int(pc.prox_tokens_per_sensor),
+            ckpt = pc.prox_encoder_ckpt or None
+            k = int(pc.prox_tokens_per_sensor)
+            if is_geometry_feature(pc.prox_feature) and k == 8:
+                k = 1
+            self._prox_encoder = build_pact_encoder(
+                pc.prox_feature,
+                checkpoint=ckpt,
+                device="cuda",
+                layout=getattr(pc, "prox_layout", "per_sensor"),
+                tokens_per_sensor=k,
             )
             policy_config["n_proximity_sensors"] = self._prox_encoder.n_act_sensors
-            policy_config["prox_tokens_per_sensor"] = self._prox_encoder.tokens_per_sensor
+            policy_config["prox_tokens_per_sensor"] = k
             policy_config["prox_feat_dim"] = self._prox_encoder.act_feat_dim
             self._prox_pool = getattr(pc, "prox_pool", "mean")
         with _detr_argv(self.pc.ckpt_dir, self.pc.seed):
@@ -264,7 +274,15 @@ class ACTInferencePolicy(InferencePolicy):
                 print(f"[act-eval] proximity ON | {prox_np.shape} "
                       f"min={prox_np.min():.3f}m max={prox_np.max():.3f}m")
             prox_t = torch.from_numpy(prox_np).float().cuda().unsqueeze(0)  # (1,40,8,8)
-            proximity_positions = self._prox_encoder(prox_t)               # (1,1,feat_dim)
+            if is_geometry_feature(pc.prox_feature):
+                self._prox_hist.append(prox_np)
+                self._prox_hist = self._prox_hist[-8:]
+                hist = np.stack(self._prox_hist, axis=0)
+                proximity_positions = encode_for_act(
+                    self._prox_encoder, torch.from_numpy(hist).float().cuda().unsqueeze(0)
+                )
+            else:
+                proximity_positions = encode_for_act(self._prox_encoder, prox_t)
 
         with torch.no_grad():
             a_hat = self._policy(qpos_t, image_t, proximity_positions=proximity_positions)
@@ -397,8 +415,15 @@ _EVAL_CELL_PROBS = {
 }
 
 
-def _apply_eval_cell(eval_cfg, cell: str) -> None:
+def _apply_eval_cell(eval_cfg, cell: str, sampler_kind: str = "invis") -> None:
     """Pin the eval task mix to one obstacle cell (see _EVAL_CELL_PROBS).
+
+    sampler_kind selects WHICH check sampler provides the cell: 'invis' is the
+    original InvisibleObstacleFumehoodPickCheckSampler (shallow side bars, matches
+    obstacle_prox_v2 / avoid_v1 training); 'gate' is
+    GateObstacleFumehoodPickCheckSampler (corridor-blocking invisible pole, matches
+    obstacle_gate_v1 training). Always score a checkpoint with the sampler its
+    training data came from — cross-sampler numbers are a train/test mismatch.
 
     Imported lazily so this script keeps working (without --eval_cell) against an older
     molmospaces checkout that predates the invisible-bar sampler. The probabilities are
@@ -407,21 +432,26 @@ def _apply_eval_cell(eval_cfg, cell: str) -> None:
     dynamic subclass -- keeps eval_cfg picklable for save_config().
     """
     try:
-        from molmo_spaces.tasks.enclosure_reach import (
-            InvisibleObstacleFumehoodPickCheckSampler as _CellSampler,
-        )
+        if sampler_kind == "gate":
+            from molmo_spaces.tasks.enclosure_reach import (
+                GateObstacleFumehoodPickCheckSampler as _CellSampler,
+            )
+        else:
+            from molmo_spaces.tasks.enclosure_reach import (
+                InvisibleObstacleFumehoodPickCheckSampler as _CellSampler,
+            )
     except ImportError as e:
         raise SystemExit(
-            f"--eval_cell {cell!r} requires InvisibleObstacleFumehoodPickCheckSampler in "
-            f"molmo_spaces.tasks.enclosure_reach; this molmospaces checkout does not have "
-            f"it ({e}). Update the submodule or drop --eval_cell."
+            f"--eval_cell {cell!r} (--eval_sampler {sampler_kind!r}) requires the "
+            f"matching check sampler in molmo_spaces.tasks.enclosure_reach; this "
+            f"molmospaces checkout does not have it ({e}). Update the submodule."
         )
     obstacle_p, invis_p = _EVAL_CELL_PROBS[cell]
     _CellSampler.OBSTACLE_P = obstacle_p
     _CellSampler.INVIS_P = invis_p
     eval_cfg.task_sampler_config.task_sampler_class = _CellSampler
     print(
-        f"[act-eval] eval_cell={cell} -> sampler=InvisibleObstacleFumehoodPickCheckSampler "
+        f"[act-eval] eval_cell={cell} -> sampler={_CellSampler.__name__} "
         f"(OBSTACLE_P={obstacle_p}, INVIS_P={invis_p})"
     )
 
@@ -482,6 +512,14 @@ def _record_episode_collision_metric(task, success: bool) -> None:
     contact_steps = sum(1 for v in diag.values() if v > 0)
     peak = max(diag.values()) if diag else 0
     first = next((s for s in sorted(diag) if diag[s] > 0), None)
+    # Per-body attribution (pick_task._obstacle_diag_bodies): split "rammed the hazard
+    # bar" (body name protr_*) from "brushed the fixture" — the blunt any-contact counter
+    # cannot, and the fixture-brush floor has historically been ~44-60%.
+    body_steps: dict[str, int] = {}
+    for step_names in (getattr(task, "_obstacle_diag_bodies", {}) or {}).values():
+        for n in step_names:
+            body_steps[n] = body_steps.get(n, 0) + 1
+    bar_steps = sum(v for n, v in body_steps.items() if n.startswith("protr"))
     rec = {
         "episode_idx": _ROLLOUT_INDEX,
         "success": int(success),
@@ -491,12 +529,17 @@ def _record_episode_collision_metric(task, success: bool) -> None:
         "obstacle_peak_contacts": int(peak),
         "obstacle_first_contact_step": (-1 if first is None else int(first)),
         "obstacle_contact_free": int(contact_steps == 0),
+        "bar_contact_steps": int(bar_steps),
+        "hit_bar": int(bar_steps > 0),
+        "contact_bodies": body_steps,
     }
     _EPISODE_METRICS.append(rec)
+    bodies_str = ",".join(f"{n}:{c}" for n, c in sorted(body_steps.items())) or "-"
     print(
         f"[act-eval] ep{_ROLLOUT_INDEX:03d} success={success} "
         f"obstacle_contact_steps={contact_steps}/{length} "
-        f"peak={peak} first_contact_step={first}"
+        f"peak={peak} first_contact_step={first} hit_bar={int(bar_steps > 0)} "
+        f"bodies={bodies_str}"
     )
     # Per-episode wandb point. Explicit step= keeps the series monotonic and decoupled
     # from any auto-incremented logs; the final aggregate is logged at step=N afterward.
@@ -532,6 +575,13 @@ def _summarize_collision_metrics() -> dict | None:
     # --end_on_collision this equals the raw success_rate (collisions already fail + truncate).
     collision_rate = mean([1 - m["obstacle_contact_free"] for m in _EPISODE_METRICS])
     strict_success = sum(1 for m in _EPISODE_METRICS if m["success"] and m["obstacle_contact_free"])
+    # Hazard-specific rates (records without the per-body fields — from an old
+    # molmospaces checkout — count as no-bar so the summary stays computable).
+    bar_hits = sum(1 for m in _EPISODE_METRICS if m.get("hit_bar", 0))
+    nonbar_collisions = sum(
+        1 for m in _EPISODE_METRICS
+        if not m["obstacle_contact_free"] and not m.get("hit_bar", 0)
+    )
     return {
         "episodes": n,
         "mean_contact_steps": mean([m["obstacle_contact_steps"] for m in _EPISODE_METRICS]),
@@ -541,6 +591,11 @@ def _summarize_collision_metrics() -> dict | None:
         "collision_rate": collision_rate,
         "strict_success": strict_success,
         "strict_success_rate": strict_success / n,
+        "bar_hits": bar_hits,
+        "bar_hit_rate": bar_hits / n,
+        "nonbar_collisions": nonbar_collisions,
+        "nonbar_collision_rate": nonbar_collisions / n,
+        "mean_bar_contact_steps": mean([m.get("bar_contact_steps", 0) for m in _EPISODE_METRICS]),
         "mean_contact_steps_success": mean([m["obstacle_contact_steps"] for m in succ]),
         "mean_contact_steps_fail": mean([m["obstacle_contact_steps"] for m in fail]),
     }
@@ -593,14 +648,23 @@ def parse_args() -> argparse.Namespace:
              "the inherited ObstacleFumehoodPickSampler mix (~75%% visible bar), i.e. the "
              "previous behavior, and never imports the invisible-bar sampler.",
     )
+    p.add_argument(
+        "--eval_sampler", choices=("invis", "gate"), default="invis",
+        help="Which check sampler provides --eval_cell: 'invis' = shallow side bars "
+             "(obstacle_prox_v2 / avoid_v1 training distribution); 'gate' = corridor-"
+             "blocking invisible pole (obstacle_gate_v1 training distribution). Always "
+             "match the checkpoint's training data.",
+    )
     # P+ACT (PACT): usually auto-detected from <ckpt_dir>/prox_config.json, so these are
     # only needed to force/override proximity on a ckpt without that file.
     p.add_argument("--use_proximity", action="store_true",
                    help="Force proximity fusion ON (normally auto-detected from prox_config.json).")
     p.add_argument("--prox_encoder_ckpt", type=str, default="",
-                   help="Safety-CVAE dir (default: assets/safety/cvae_v3).")
-    p.add_argument("--prox_feature", type=str, default="trunk",
-                   choices=("trunk", "delta", "raw"))
+                   help="Safety-CVAE dir. Only for trunk/delta; raw needs none.")
+    p.add_argument("--prox_feature", type=str, default="raw",
+                   choices=("trunk", "delta", "raw", "peak_closeness",
+                            "nearest_surface", "surface_embedding",
+                            "xyz", "embedding"))
     p.add_argument("--prox_tokens_per_sensor", type=int, default=8)
     p.add_argument(
         "--live", "--render", "--viewer",
@@ -641,7 +705,7 @@ def main() -> None:
     eval_cfg.task_sampler_config.samples_per_house = args.num_rollouts
     eval_cfg.task_sampler_config.house_inds = [args.house_ind]
     if args.eval_cell:
-        _apply_eval_cell(eval_cfg, args.eval_cell)
+        _apply_eval_cell(eval_cfg, args.eval_cell, args.eval_sampler)
 
     # Live viewer (desktop): keep $DISPLAY (already kept by the argv peek at import) and
     # ask the pipeline to launch the passive GLFW window. The window must live in the
@@ -784,6 +848,14 @@ def main() -> None:
                 f"{collision['strict_success']}/{collision['episodes']}  "
                 f"({collision['strict_success_rate']*100:.1f}%)"
             )
+            # The hazard-specific headline: episodes that struck the bar itself,
+            # separated from the fixture-brush floor.
+            print(
+                f"[act-eval] bar_hit {collision['bar_hits']}/{collision['episodes']} "
+                f"({collision['bar_hit_rate']*100:.1f}%)  "
+                f"nonbar_collisions {collision['nonbar_collisions']}/"
+                f"{collision['episodes']} ({collision['nonbar_collision_rate']*100:.1f}%)"
+            )
 
         # Self-describing results file: which checkpoint was scored on which obstacle
         # cell (eval_cell=null means the inherited ~75%-visible-bar mix), plus the
@@ -792,6 +864,7 @@ def main() -> None:
             "ckpt_dir": pc.ckpt_dir,
             "ckpt_name": pc.ckpt_name,
             "eval_cell": args.eval_cell,
+            "eval_sampler": args.eval_sampler,
             "task_sampler_class": eval_cfg.task_sampler_config.task_sampler_class.__name__,
             "num_rollouts": args.num_rollouts,
             "house_ind": args.house_ind,
@@ -842,10 +915,11 @@ def _log_per_episode_table_to_wandb(step: int | None = None) -> None:
         "episode_idx", "success", "length",
         "obstacle_contact_steps", "obstacle_contact_fraction",
         "obstacle_peak_contacts", "obstacle_first_contact_step", "obstacle_contact_free",
+        "hit_bar", "bar_contact_steps",
     ]
     table = wandb.Table(columns=cols)
     for m in _EPISODE_METRICS:
-        table.add_data(*[m[c] for c in cols])
+        table.add_data(*[m.get(c, 0) for c in cols])
     try:
         _WANDB_RUN.log({"eval/per_episode": table}, step=step)
     except Exception as e:

@@ -38,7 +38,7 @@ class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names,
                  action_dim=None, n_proximity_sensors=0, prox_tokens_per_sensor=1,
-                 prox_feat_dim=3):
+                 prox_feat_dim=3, proximity_feature_dim=None):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -78,10 +78,17 @@ class DETRVAE(nn.Module):
         self.action_dim = action_dim
         self.n_proximity_sensors = int(n_proximity_sensors)
         self.prox_tokens_per_sensor = int(prox_tokens_per_sensor)
+        if proximity_feature_dim is not None:
+            prox_feat_dim = proximity_feature_dim
         self.prox_feat_dim = int(prox_feat_dim)
+        self.proximity_feature_dim = self.prox_feat_dim
         if self.prox_tokens_per_sensor < 1:
             raise ValueError(
                 f"prox_tokens_per_sensor must be >= 1, got {self.prox_tokens_per_sensor}"
+            )
+        if self.prox_feat_dim < 1:
+            raise ValueError(
+                f"prox_feat_dim must be >= 1, got {self.prox_feat_dim}"
             )
         hidden_dim = transformer.d_model
         self.action_head = nn.Linear(hidden_dim, action_dim)
@@ -208,6 +215,12 @@ class DETRVAE(nn.Module):
                     raise ValueError(
                         f"proximity_positions has {proximity_positions.shape[1]} "
                         f"sensors but model expects {self.n_proximity_sensors}"
+                    )
+                if proximity_positions.ndim != 3 or proximity_positions.shape[2] != self.prox_feat_dim:
+                    raise ValueError(
+                        "proximity feature width "
+                        f"{tuple(proximity_positions.shape)} but model expects "
+                        f"(B, {self.n_proximity_sensors}, {self.prox_feat_dim})"
                     )
                 K = self.prox_tokens_per_sensor
                 hidden_dim = self.input_proj_proximity.out_features // K

@@ -9,18 +9,25 @@ e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, num_queries,
-                 load_proximity=False):
+                 load_proximity=False, proximity_layout="raw",
+                 n_proximity_sensors=0, proximity_feature_dim=3,
+                 expected_proximity_encoder_sha256=None):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.num_queries = num_queries
-        # P+ACT: when True, __getitem__ also returns the raw (40, 8, 8) proximity
-        # depths at start_ts (in meters, UN-normalized — the frozen Safety-CVAE
-        # extractor featurizes them itself). Requires /observations/proximity in
-        # the episode HDF5 (written by convert_obstacle_to_act.py --with_proximity).
+        # P+ACT: when True, __getitem__ also returns a proximity tensor.
+        # layout "raw"        -> (40, 8, 8) metres (peak-closeness encoder)
+        # layout "raw_causal" -> (8, 40, 8, 8) last 8 pooled steps (geometry encoder)
+        # layout "embeddings" -> (40, 32) frozen surface-embedding tokens
+        # layout "positions"  -> (40, 3)  frozen nearest-surface XYZ
         self.load_proximity = load_proximity
+        self.proximity_layout = proximity_layout
+        self.n_proximity_sensors = int(n_proximity_sensors)
+        self.proximity_feature_dim = int(proximity_feature_dim)
+        self.expected_proximity_encoder_sha256 = expected_proximity_encoder_sha256
         self.is_sim = None
         self.__getitem__(0) # initialize self.is_sim
 
@@ -48,12 +55,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
             proximity = None
             if self.load_proximity:
-                if '/observations/proximity' not in root:
-                    raise KeyError(
-                        f"{dataset_path} has no /observations/proximity — re-run "
-                        f"convert_obstacle_to_act.py with --with_proximity."
-                    )
-                proximity = root['/observations/proximity'][start_ts]  # (40, 8, 8) meters
+                proximity = self._load_proximity(root, dataset_path, start_ts)
             # get all actions after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
@@ -93,11 +95,56 @@ class EpisodicDataset(torch.utils.data.Dataset):
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
         if self.load_proximity:
-            # Raw depths in meters; the frozen CVAE extractor featurizes (closeness).
             prox_data = torch.from_numpy(np.asarray(proximity, dtype=np.float32)).float()
             return image_data, qpos_data, action_data, is_pad, prox_data
 
         return image_data, qpos_data, action_data, is_pad
+
+    def _load_proximity(self, root, dataset_path, start_ts):
+        layout = self.proximity_layout
+        if layout in ("embeddings", "positions"):
+            feature_name = (
+                "proximity_positions" if layout == "positions" else "proximity_embeddings"
+            )
+            feature_path = f"/observations/{feature_name}"
+            if feature_path not in root:
+                raise ValueError(
+                    f"{dataset_path}: {feature_name} missing — run "
+                    f"`python -m encoders.encode_tokens`."
+                )
+            proximity_positions = root[feature_path][start_ts]
+            expected_shape = (self.n_proximity_sensors, self.proximity_feature_dim)
+            if proximity_positions.shape != expected_shape:
+                raise ValueError(
+                    f"{dataset_path}: {feature_name} shape "
+                    f"{proximity_positions.shape} != {expected_shape}"
+                )
+            observed_sha = root.attrs.get("pact_surface_encoder_sha256")
+            if isinstance(observed_sha, bytes):
+                observed_sha = observed_sha.decode()
+            expected = self.expected_proximity_encoder_sha256
+            if expected and observed_sha != expected:
+                raise ValueError(
+                    f"{dataset_path}: surface encoder sha256 {observed_sha} != {expected}"
+                )
+            return proximity_positions
+        if "/observations/proximity" not in root:
+            raise KeyError(
+                f"{dataset_path} has no /observations/proximity — re-run "
+                f"convert_obstacle_to_act.py with --with_proximity."
+            )
+        prox = root["/observations/proximity"]
+        if layout == "raw_causal":
+            start = max(0, int(start_ts) - 7)
+            block = np.asarray(prox[start : int(start_ts) + 1], dtype=np.float32)
+            if block.ndim == 5 and block.shape[2] == 4:
+                block = block.mean(axis=2)
+            if len(block) < 8:
+                block = np.concatenate(
+                    (np.repeat(block[:1], 8 - len(block), axis=0), block), axis=0
+                )
+            return block
+        return prox[start_ts]
 
 
 def get_norm_stats(dataset_dir, num_episodes):
@@ -134,7 +181,9 @@ def get_norm_stats(dataset_dir, num_episodes):
 
 
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
-              load_proximity=False):
+              load_proximity=False, proximity_layout="raw",
+              n_proximity_sensors=0, proximity_feature_dim=3,
+              expected_proximity_encoder_sha256=None):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -147,9 +196,17 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries,
-                                    load_proximity=load_proximity)
+                                    load_proximity=load_proximity,
+                                    proximity_layout=proximity_layout,
+                                    n_proximity_sensors=n_proximity_sensors,
+                                    proximity_feature_dim=proximity_feature_dim,
+                                    expected_proximity_encoder_sha256=expected_proximity_encoder_sha256)
     val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, num_queries,
-                                  load_proximity=load_proximity)
+                                  load_proximity=load_proximity,
+                                  proximity_layout=proximity_layout,
+                                  n_proximity_sensors=n_proximity_sensors,
+                                  proximity_feature_dim=proximity_feature_dim,
+                                  expected_proximity_encoder_sha256=expected_proximity_encoder_sha256)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

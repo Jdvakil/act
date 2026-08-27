@@ -89,10 +89,13 @@ def get_args_parser():
     # feature; 7 = CVAE retreat-delta. Plumbed through args_override (policy_config),
     # declared here so the re-parse in build_ACT_model_and_optimizer accepts it.
     parser.add_argument('--prox_feat_dim', type=int, default=3)
+    parser.add_argument('--proximity_feature_dim', type=int, default=None)
     # P+ACT: which frozen Safety-CVAE feature to inject ('trunk' 256-d or 'delta' 7-d).
     # Consumed by imitate_episodes.py to build the extractor; a no-op here.
     parser.add_argument('--prox_feature', type=str, default='raw',
-                        choices=('trunk', 'delta', 'raw'))
+                        choices=('trunk', 'delta', 'raw', 'peak_closeness',
+                                 'nearest_surface', 'surface_embedding',
+                                 'xyz', 'embedding'))
     parser.add_argument('--prox_layout', type=str, default='per_sensor',
                         choices=('global', 'per_sensor'))
     parser.add_argument('--prox_pool', type=str, default=None, choices=('mean', 'min'))

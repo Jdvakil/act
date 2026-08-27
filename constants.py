@@ -93,10 +93,44 @@ TASK_CONFIGS = {
         # (2026-08-23): drop inbound scrapes except deflect grazes, min-pool
         # skin substeps, 3× upsample bows. 125 source trajs − 25 fail − 13
         # non-deflect collisions = 87 unique (32 deflect × 3 + 55 free = 151).
+        # RESULT (2026-08-24, n=50 invisible): PACT 30% vs vanilla 40% collisions,
+        # p≈0.40, success down — failed the ≥15pt/p<0.05 bar. Superseded by
+        # obstacle_gate_v1: the bows here were learnable from vision alone.
         'dataset_dir': str(ACT_DATA_DIR / 'obstacle_prox_avoid_v1'),
         'num_episodes': 151,
         'episode_len': 140,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'obstacle_gate_v1': {
+        # GATE-BAR dataset (v3.1, 2026-08-24): 44 cm pole snapped onto the live
+        # TCP line (~18 cm bow), bow sign = wall coin-flip, INVIS_P=1.0 so no
+        # training episode ever renders the pole. Cup y is independent of bar
+        # fields; cameras see where the line is, not which way is open.
+        # Source: FrankaSkinHybridGateBarConfig -> assets/datagen/hybrid_gate_bar_v1,
+        # converted by scripts/convert_obstacle_to_act.py --with_proximity
+        # --prox_pool min --skip_approach_collision (no upsample; every bar ep bows).
+        # num_episodes / episode_len are placeholders until convert prints the real
+        # counts — paste them here (convert refuses nothing; training with 0 would
+        # see an empty set).
+        'dataset_dir': str(ACT_DATA_DIR / 'obstacle_gate_v1'),
+        'num_episodes': 0,     # <- paste from convert output
+        'episode_len': 0,      # <- paste from convert output
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pact_place_corridor_v5': {
+        # Coauthor recovered pick-and-place corridor (HF Lundii/pact_place_corridor_v5).
+        # 152 clean-success demos. Wrist RGB only (no exo). 40-sensor skin in
+        # /observations/proximity. Scene XML is pact_place_corridor_v2; HF name is
+        # the v5 recovery schema. Convert:
+        #   python -m scripts.convert_pact_place_to_act \
+        #       --src data/pact_place_corridor_v5 \
+        #       --dst act_style_data/pact_place_corridor_v5 \
+        #       --with_proximity --prox_pool min --image_h 240 --image_w 320
+        # Converted 2026-08-25: 152/152 clean, max T=634, sides left=72 right=80.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor_v5'),
+        'num_episodes': 152,
+        'episode_len': 636,
+        'camera_names': ['wrist_camera'],
     },
 }
 
