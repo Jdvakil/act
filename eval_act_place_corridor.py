@@ -113,9 +113,21 @@ def _install_metrics_only_hooks() -> None:
             f"[act-eval-place] skip trajectory/video save ({n} episodes, metrics-only)"
         )
         if house_raw_histories is not None:
+            for ep in house_raw_histories:
+                if isinstance(ep, dict):
+                    ep.pop("sensor_suite", None)
+                    ep.pop("history", None)
             house_raw_histories.clear()
+        import gc
+
+        gc.collect()
 
     def _tiny_history(self):
+        # Pipeline keeps house_raw_histories until the house ends and stores
+        # task.sensor_suite on every episode. Drop the suite here so 50 eval
+        # episodes cannot pin 50 copies of 41 cameras.
+        if getattr(self, "_sensor_suite", None) is not None:
+            self._sensor_suite = None
         return {
             "observations": [],
             "rewards": [],
