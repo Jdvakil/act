@@ -113,7 +113,12 @@ if str(_REPO_ROOT) not in sys.path:
 from policy import ACTPolicy
 from utils import set_seed
 from prox_cvae import stack_obs_proximity
-from encoders.pact import build_pact_encoder, encode_for_act, is_geometry_feature
+from encoders.pact import (
+    build_pact_encoder,
+    encode_for_act,
+    is_geometry_feature,
+    resolve_act_encoder_load,
+)
 
 # molmospaces imports — eval target env / policy framework.
 from molmo_spaces.configs.policy_configs import BasePolicyConfig
@@ -142,8 +147,10 @@ class ACTInferencePolicy(InferencePolicy):
         self._pending_chunks: list[tuple[int, np.ndarray]] = []
         self._policy = None
         self._stats = None
-        self._prox_encoder = None  # P+ACT frozen skin encoder
+        self._prox_encoder = None  # P+ACT skin encoder (frozen or finetuned)
         self._prox_hist: list[np.ndarray] = []
+        self._prox_pcfg: dict | None = None
+        self.gripper_close_commanded = False
 
     def reset(self) -> None:
         # Per-episode wandb logging (index, length, collisions) is owned by
@@ -153,6 +160,7 @@ class ACTInferencePolicy(InferencePolicy):
         self._step = 0
         self._pending_chunks.clear()
         self._prox_hist = []
+        self.gripper_close_commanded = False
 
     def prepare_model(self, model_name: str | None = None) -> None:
         pc = self.pc
@@ -171,21 +179,35 @@ class ACTInferencePolicy(InferencePolicy):
             "state_dim": pc.state_dim,
             "action_dim": pc.action_dim,
         }
-        # P+ACT: build the SAME frozen Safety-CVAE feature extractor used at train time
-        # and switch on the proximity tokens (n_proximity_sensors=1, K, feat_dim). The
-        # values come from the ckpt's prox_config.json (set in main), so train/eval match.
+        # P+ACT: rebuild the train-time skin encoder. Finetuned runs load
+        # prox_encoder_best.pt from this ckpt dir and keep the 128-d CLS readout.
         if pc.use_proximity:
             ckpt = pc.prox_encoder_ckpt or None
             k = int(pc.prox_tokens_per_sensor)
             if is_geometry_feature(pc.prox_feature) and k == 8:
                 k = 1
+            load_kwargs = {}
+            pcfg_path = Path(pc.ckpt_dir) / "prox_config.json"
+            if pcfg_path.is_file():
+                self._prox_pcfg = json.loads(pcfg_path.read_text())
+                load_kwargs = resolve_act_encoder_load(
+                    pc.ckpt_dir, self._prox_pcfg, ckpt or ""
+                )
+            else:
+                load_kwargs = {
+                    "checkpoint": ckpt,
+                    "frozen": not bool(getattr(pc, "finetune_prox_encoder", False)),
+                    "policy_tap": getattr(pc, "prox_policy_tap", None) or None,
+                }
             self._prox_encoder = build_pact_encoder(
                 pc.prox_feature,
-                checkpoint=ckpt,
                 device="cuda",
                 layout=getattr(pc, "prox_layout", "per_sensor"),
                 tokens_per_sensor=k,
+                **load_kwargs,
             )
+            if self._prox_encoder is not None:
+                self._prox_encoder.eval()
             policy_config["n_proximity_sensors"] = self._prox_encoder.n_act_sensors
             policy_config["prox_tokens_per_sensor"] = k
             policy_config["prox_feat_dim"] = self._prox_encoder.act_feat_dim
@@ -317,7 +339,25 @@ class ACTInferencePolicy(InferencePolicy):
         # Training gripper command is the FR3 hand actuator at {0, 255}; snap the
         # continuous prediction back to the nearest extreme.
         gripper = 0.0 if gripper_raw < 127.5 else 255.0
+        if gripper == 255.0:
+            self.gripper_close_commanded = True
         return {"arm": arm, "gripper": np.asarray([gripper], dtype=np.float32)}
+
+    def needs_fresh_policy_observation(self) -> bool:
+        """True iff the next ``inference_model`` call will read cameras / skin.
+
+        With ``--temp_agg_off`` the policy keeps an open-loop chunk and ignores
+        observations until that chunk is exhausted. Rendering 40 proximity
+        cameras on those idle steps is wasted EGL (~0.75 s/step, ~12 h / 50).
+        Gating renders to query steps is bit-identical for the executed action.
+        """
+        if not self.pc.temp_agg_off:
+            return True
+        if not self._pending_chunks:
+            return True
+        start, chunk = self._pending_chunks[0]
+        age = self._step - start
+        return not (0 <= age < len(chunk))
 
     def get_action(self, obs):
         action = super().get_action(obs)
@@ -361,6 +401,8 @@ class ACTPolicyConfig(BasePolicyConfig):
     prox_layout: str = "global"
     prox_pool: str = "mean"
     prox_tokens_per_sensor: int = 8
+    finetune_prox_encoder: bool = False
+    prox_policy_tap: str = ""
 
 
 # ----------------------------------------------------------------------
@@ -758,9 +800,12 @@ def main() -> None:
         pc.prox_pool = pcfg.get("prox_pool", "mean")
         pc.prox_tokens_per_sensor = int(pcfg.get("prox_tokens_per_sensor", 8))
         pc.prox_encoder_ckpt = args.prox_encoder_ckpt or pcfg.get("prox_encoder_ckpt", "")
+        pc.finetune_prox_encoder = bool(pcfg.get("finetune_prox_encoder"))
+        pc.prox_policy_tap = str(pcfg.get("prox_policy_tap") or "")
         print(f"[act-eval] PACT ckpt detected -> proximity ON "
               f"(feature={pc.prox_feature}, layout={pc.prox_layout}, "
-              f"K={pc.prox_tokens_per_sensor}, pool={pc.prox_pool})")
+              f"K={pc.prox_tokens_per_sensor}, pool={pc.prox_pool}, "
+              f"finetune={pc.finetune_prox_encoder}, tap={pc.prox_policy_tap or 'default'})")
     elif args.use_proximity:
         pc.use_proximity = True
         pc.prox_feature = args.prox_feature

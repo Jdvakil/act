@@ -23,6 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from attn_heatmap import build_policy   # builds ACTPolicy + stats + prox extractor (no sim)
+from encoders.pact import encode_for_act
 from utils import EpisodicDataset, set_seed
 
 
@@ -39,10 +40,23 @@ def main():
 
     policy, stats, extractor, n_prox, label = build_policy(args.ckpt_dir, args.device)
     is_pact = extractor is not None
+    prox_layout = "raw"
+    n_sensors = 0
+    feat_dim = 3
+    pcfg_path = args.ckpt_dir / "prox_config.json"
+    if pcfg_path.is_file():
+        import json
+        pcfg = json.loads(pcfg_path.read_text())
+        prox_layout = pcfg.get("proximity_layout", "raw")
+        n_sensors = int(pcfg.get("n_proximity_sensors") or 0)
+        feat_dim = int(pcfg.get("prox_feat_dim") or 3)
 
     ds = EpisodicDataset(np.arange(args.num_episodes), str(args.data_dir),
                          ["exo_camera_1", "wrist_camera"], stats, args.chunk,
-                         load_proximity=is_pact)
+                         load_proximity=is_pact,
+                         proximity_layout=prox_layout,
+                         n_proximity_sensors=n_sensors,
+                         proximity_feature_dim=feat_dim)
     dl = DataLoader(ds, batch_size=8, shuffle=True, num_workers=2)
     action_std = torch.tensor(np.asarray(stats["action_std"]), dtype=torch.float32, device=args.device)
 
@@ -56,7 +70,7 @@ def main():
                 if is_pact:
                     image, qpos, action, is_pad, prox = batch
                     prox = prox.to(args.device)
-                    prox_pos = extractor(prox)
+                    prox_pos = encode_for_act(extractor, prox)
                 else:
                     image, qpos, action, is_pad = batch
                     prox_pos = None

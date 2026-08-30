@@ -40,7 +40,11 @@ from policy import ACTPolicy
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from encoders.pact import build_pact_encoder, is_geometry_feature
+from encoders.pact import (
+    build_pact_encoder,
+    is_geometry_feature,
+    resolve_act_encoder_load,
+)
 
 CAM_NAMES = ("exo_camera_1", "wrist_camera")
 H_FEAT, W_FEAT = 8, 10          # resnet18 layer4 feature grid for a 240x320 image
@@ -76,11 +80,13 @@ def build_policy(ckpt_dir: Path, device: str = "cuda"):
             k = 1
         extractor = build_pact_encoder(
             feat,
-            checkpoint=pcfg.get("prox_encoder_ckpt") or None,
             device=device,
             layout=pcfg.get("prox_layout", "global"),
             tokens_per_sensor=k,
+            **resolve_act_encoder_load(ckpt_dir, pcfg),
         )
+        if extractor is not None:
+            extractor.eval()
         cfg["n_proximity_sensors"] = extractor.n_act_sensors
         cfg["prox_tokens_per_sensor"] = k
         cfg["prox_feat_dim"] = extractor.act_feat_dim

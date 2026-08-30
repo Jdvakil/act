@@ -108,13 +108,13 @@ def main(args):
     else:
         raise NotImplementedError
 
-    # P+ACT (PACT): load the frozen Safety-CVAE skin feature extractor and switch on
-    # the proximity conditioning tokens. The extractor maps the live 40x8x8 skin depth
-    # to a feature (256-d decoder trunk, or 7-d retreat delta) that becomes K extra
-    # ACT encoder tokens. The CVAE is frozen — only the ACT-side projection + extra
-    # positional embeddings learn. With --use_proximity OFF the model is bit-identical
-    # to vanilla ACT (n_proximity_sensors stays 0).
+    # P+ACT (PACT): load the skin encoder and switch on proximity tokens.
+    # Frozen by default (CVAE taps / 32-d embedding). --finetune_prox_encoder
+    # unfreezes the geometry stem and feeds 128-d CLS readout tokens at train
+    # and eval. With --use_proximity OFF the model is bit-identical to vanilla ACT.
     use_proximity = args.get('use_proximity', False)
+    if args.get('finetune_prox_encoder') and not use_proximity:
+        raise SystemExit('[P+ACT] --finetune_prox_encoder needs --use_proximity')
     if is_eval and use_proximity:
         raise SystemExit(
             "[P+ACT] imitate_episodes.py --eval never feeds proximity_positions. "
@@ -135,6 +135,21 @@ def main(args):
         )
         prox_feature = args.get('prox_feature') or 'raw'
         prox_ckpt = args.get('prox_encoder_ckpt') or ''
+        finetune_prox = bool(args.get('finetune_prox_encoder'))
+        policy_tap = args.get('prox_policy_tap') or None
+        if finetune_prox:
+            if not is_geometry_feature(prox_feature):
+                raise SystemExit(
+                    '[P+ACT] --finetune_prox_encoder needs --prox_feature '
+                    'surface_embedding (or nearest_surface).'
+                )
+            if not prox_ckpt:
+                raise SystemExit(
+                    '[P+ACT] --finetune_prox_encoder needs --prox_encoder_ckpt '
+                    '(pretrained pact_surface_*_v1 start).'
+                )
+            if not policy_tap:
+                policy_tap = 'readout'
         if prox_feature in ('trunk', 'delta') and not prox_ckpt:
             raise SystemExit(
                 '[P+ACT] trunk/delta need --prox_encoder_ckpt; CVAE weights were removed. '
@@ -143,7 +158,7 @@ def main(args):
         if is_geometry_feature(prox_feature) and not prox_ckpt:
             print(
                 '[P+ACT] geometry encoder has NO checkpoint — untrained weights. '
-                'Pass --prox_encoder_ckpt with a frozen pact_surface_*_v1 file.'
+                'Pass --prox_encoder_ckpt with a pact_surface_*_v1 file.'
             )
         prox_layout = args.get('prox_layout') or 'per_sensor'
         prox_K = int(args.get('prox_tokens_per_sensor') or 8)
@@ -155,6 +170,8 @@ def main(args):
             device='cuda',
             layout=prox_layout,
             tokens_per_sensor=prox_K,
+            frozen=not finetune_prox,
+            policy_tap=policy_tap,
         )
         policy_config['n_proximity_sensors'] = prox_encoder.n_act_sensors
         policy_config['prox_tokens_per_sensor'] = prox_K
@@ -165,8 +182,13 @@ def main(args):
             prox_pool = 'mean'
             if os.path.isfile(meta_path):
                 prox_pool = json.load(open(meta_path)).get('prox_pool', 'mean')
-        prox_layout_data = hdf5_proximity_layout(dataset_dir, prox_feature)
-        train_encoder = None if prox_layout_data in ('embeddings', 'positions') else prox_encoder
+        prox_layout_data = hdf5_proximity_layout(
+            dataset_dir, prox_feature, force_live=finetune_prox,
+        )
+        # Baked tokens skip the net. Finetune / live readout must keep the encoder.
+        train_encoder = None if (
+            (not finetune_prox) and prox_layout_data in ('embeddings', 'positions')
+        ) else prox_encoder
         prox_cfg_json = {
             'use_proximity': True,
             'prox_encoder_ckpt': str(prox_ckpt) if prox_ckpt else '',
@@ -178,10 +200,15 @@ def main(args):
             'n_proximity_sensors': prox_encoder.n_act_sensors,
             'sensor_order': prox_encoder.sensor_order,
             'proximity_layout': prox_layout_data,
+            'finetune_prox_encoder': finetune_prox,
+            'prox_policy_tap': getattr(prox_encoder, 'policy_tap', policy_tap or ''),
+            'prox_encoder_finetuned': 'prox_encoder_best.pt' if finetune_prox else '',
+            'prox_encoder_lr': args.get('prox_encoder_lr'),
         }
         print(f"[P+ACT] proximity fusion ON: feature={prox_feature} layout={prox_encoder.layout} "
               f"n_sensors={prox_encoder.n_act_sensors} feat_dim={prox_encoder.act_feat_dim} "
-              f"K={prox_K} pool={prox_pool} data={prox_layout_data} ckpt={prox_ckpt}")
+              f"K={prox_K} pool={prox_pool} data={prox_layout_data} ckpt={prox_ckpt} "
+              f"frozen={not finetune_prox} tap={prox_cfg_json['prox_policy_tap']}")
         prox_encoder = train_encoder
 
     # wandb: log by default (opt out with --no_wandb). Run name auto-built as
@@ -219,6 +246,8 @@ def main(args):
         'use_proximity': use_proximity,
         'prox_encoder': prox_encoder,
         'prox_feature': (args.get('prox_feature') or 'raw') if use_proximity else None,
+        'finetune_prox_encoder': bool(args.get('finetune_prox_encoder')),
+        'prox_encoder_lr': args.get('prox_encoder_lr'),
         'blur_sigma0': args.get('blur_sigma0') or 0.0,
         'blur_curriculum_steps': args.get('blur_curriculum_steps'),
         'blur_mode': args.get('blur_mode') or 'curriculum',
@@ -559,6 +588,20 @@ def forward_pass(data, policy, prox_encoder=None, blur_sigma=0.0,
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
+def _save_prox_encoder(path, prox_encoder):
+    """Write inner surface-encoder weights next to the ACT policy ckpt."""
+    from encoders.surface_geometry import save_encoder_checkpoint
+    inner = getattr(prox_encoder, "inner", prox_encoder)
+    kind = getattr(prox_encoder, "kind", "embedding")
+    extra = {
+        "policy_tap": getattr(prox_encoder, "policy_tap", "readout"),
+        "validity_threshold": getattr(prox_encoder, "validity_threshold", 0.5),
+    }
+    save_encoder_checkpoint(
+        path, inner, kind, extra=extra, frozen=False,
+    )
+
+
 def train_bc(train_dataloader, val_dataloader, config):
     num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
@@ -599,11 +642,22 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
-    # P+ACT: frozen Safety-CVAE feature extractor (None for vanilla ACT). Passed into
-    # forward_pass to turn raw skin depths into the proximity conditioning feature.
+    # P+ACT: skin encoder. Frozen by default; --finetune_prox_encoder adds it
+    # to the optimizer and uses CLS readout tokens at train and eval.
     prox_encoder = config.get('prox_encoder')
-    if prox_encoder is not None:
+    finetune_prox = bool(config.get('finetune_prox_encoder')) and prox_encoder is not None
+    if prox_encoder is not None and not finetune_prox:
         prox_encoder.eval()
+    if finetune_prox:
+        enc_lr = float(config.get('prox_encoder_lr') or config.get('lr') or 1e-5)
+        encoder_params = [p for p in prox_encoder.parameters() if p.requires_grad]
+        if not encoder_params:
+            raise SystemExit('[P+ACT] --finetune_prox_encoder but encoder has no grads')
+        optimizer.add_param_group({'params': encoder_params, 'lr': enc_lr})
+        n_enc = sum(p.numel() for p in encoder_params)
+        print(f"[P+ACT] finetune skin encoder ON: {n_enc} params lr={enc_lr} "
+              f"tap={getattr(prox_encoder, 'policy_tap', None)} "
+              f"feat_dim={getattr(prox_encoder, 'act_feat_dim', None)}")
 
     # FACTR visual curriculum: blur_sigma_n = sigma0 * (1 - n/N) at global training
     # step n; images start strongly blurred and sharpen linearly, forcing the policy
@@ -640,11 +694,14 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    best_encoder_state = None
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
         # validation
         with torch.inference_mode():
             policy.eval()
+            if prox_encoder is not None:
+                prox_encoder.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
                 forward_dict = forward_pass(data, policy, prox_encoder)
@@ -656,6 +713,11 @@ def train_bc(train_dataloader, val_dataloader, config):
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
                 best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                if finetune_prox:
+                    best_encoder_state = deepcopy(prox_encoder.inner.state_dict())
+                    _save_prox_encoder(
+                        os.path.join(ckpt_dir, 'prox_encoder_best.pt'), prox_encoder
+                    )
         print(f'Val loss:   {epoch_val_loss:.5f}')
         summary_string = ''
         for k, v in epoch_summary.items():
@@ -664,6 +726,8 @@ def train_bc(train_dataloader, val_dataloader, config):
 
         # training
         policy.train()
+        if finetune_prox:
+            prox_encoder.train()
         optimizer.zero_grad()
         for batch_idx, data in enumerate(train_dataloader):
             if blur_mode == 'constant':
@@ -703,10 +767,19 @@ def train_bc(train_dataloader, val_dataloader, config):
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
+            if finetune_prox:
+                _save_prox_encoder(os.path.join(ckpt_dir, 'prox_encoder.pt'), prox_encoder)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
+    if finetune_prox:
+        _save_prox_encoder(os.path.join(ckpt_dir, 'prox_encoder.pt'), prox_encoder)
+        if best_encoder_state is not None:
+            prox_encoder.inner.load_state_dict(best_encoder_state)
+            _save_prox_encoder(
+                os.path.join(ckpt_dir, 'prox_encoder_best.pt'), prox_encoder
+            )
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
@@ -764,16 +837,26 @@ if __name__ == '__main__':
                         help='Fuse the frozen Safety-CVAE skin feature into ACT as extra '
                              'encoder tokens (PACT). Requires the obstacle_pact task data.')
     parser.add_argument('--prox_encoder_ckpt', type=str, default=None,
-                        help='Frozen encoder. CVAE dir for trunk/delta; '
+                        help='Encoder start. CVAE dir for trunk/delta; '
                              'pact_surface_*_v1.pt for nearest_surface / surface_embedding. '
-                             'raw needs none.')
+                             'raw needs none. Finetune writes a new copy in the run dir.')
+    parser.add_argument('--finetune_prox_encoder', action='store_true',
+                        help='Unfreeze the geometry encoder and train it with ACT. '
+                             'Policy tap is the 128-d CLS readout (not the frozen 32-d '
+                             'embedding). Live raw_causal skin; do not bake tokens.')
+    parser.add_argument('--prox_policy_tap', type=str, default=None,
+                        choices=('embedding', 'readout', 'xyz'),
+                        help="Geometry policy feature. Default: embedding when frozen, "
+                             "readout when --finetune_prox_encoder.")
+    parser.add_argument('--prox_encoder_lr', type=float, default=None,
+                        help='LR for the unfrozen skin encoder. Default: same as --lr.')
     parser.add_argument('--prox_feature', type=str, default='raw',
                         choices=('trunk', 'delta', 'raw', 'peak_closeness',
                                  'nearest_surface', 'surface_embedding',
                                  'xyz', 'embedding'),
                         help="Skin feature: 'raw'/'peak_closeness' (40-d peak closeness), "
                              "'nearest_surface'/'xyz' (3-d local point), "
-                             "'surface_embedding'/'embedding' (32-d geometry), "
+                             "'surface_embedding'/'embedding' (32-d frozen or 128-d CLS readout), "
                              "'trunk'/'delta' (deleted CVAE taps).")
     parser.add_argument('--prox_layout', type=str, default='per_sensor',
                         choices=('global', 'per_sensor'),

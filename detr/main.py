@@ -104,6 +104,10 @@ def get_args_parser():
     # error out when the trainer constructs the policy.
     parser.add_argument('--use_proximity', action='store_true')
     parser.add_argument('--prox_encoder_ckpt', type=str, default=None)
+    parser.add_argument('--finetune_prox_encoder', action='store_true')
+    parser.add_argument('--prox_policy_tap', type=str, default=None,
+                        choices=('embedding', 'readout', 'xyz'))
+    parser.add_argument('--prox_encoder_lr', type=float, default=None)
     parser.add_argument('--prox_mapping_json', type=str, default=None)
     parser.add_argument('--num_workers', type=int, default=1)
     # FACTR visual-curriculum flags consumed by imitate_episodes.py; declared here
