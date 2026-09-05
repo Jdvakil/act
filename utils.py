@@ -147,14 +147,13 @@ class EpisodicDataset(torch.utils.data.Dataset):
         return prox[start_ts]
 
 
-def get_norm_stats(dataset_dir, num_episodes):
+def get_norm_stats(dataset_dir, num_episodes, episode_ids=None):
     all_qpos_data = []
     all_action_data = []
-    for episode_idx in range(num_episodes):
+    for episode_idx in (range(num_episodes) if episode_ids is None else episode_ids):
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
-            qvel = root['/observations/qvel'][()]
             action = root['/action'][()]
         all_qpos_data.append(torch.from_numpy(qpos))
         all_action_data.append(torch.from_numpy(action))
@@ -183,16 +182,27 @@ def get_norm_stats(dataset_dir, num_episodes):
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
               load_proximity=False, proximity_layout="raw",
               n_proximity_sensors=0, proximity_feature_dim=3,
-              expected_proximity_encoder_sha256=None):
+              expected_proximity_encoder_sha256=None, split=None):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
-    train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
-    train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+    if split is None:
+        shuffled_indices = np.random.permutation(num_episodes)
+        train_indices = shuffled_indices[:int(0.8 * num_episodes)]
+        val_indices = shuffled_indices[int(0.8 * num_episodes):]
+    else:
+        train_indices, val_indices = split['train'], split['val']
+        if (not train_indices or not val_indices or
+                len(set(train_indices)) != len(train_indices) or
+                len(set(val_indices)) != len(val_indices) or
+                set(train_indices) & set(val_indices) or
+                set(train_indices) | set(val_indices) != set(range(num_episodes))):
+            raise ValueError('explicit split must partition the dataset exactly once')
+        if split.get('normalization') != 'train_only':
+            raise ValueError('explicit split requires train_only normalization')
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes)
+    norm_stats = get_norm_stats(dataset_dir, num_episodes,
+                               episode_ids=train_indices if split is not None else None)
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, num_queries,

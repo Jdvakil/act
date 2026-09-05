@@ -54,8 +54,20 @@ def main(args):
     num_epochs = args['num_epochs']
 
     # get task parameters
+    experiment = None
     is_sim = task_name[:4] == 'sim_'
-    if is_sim:
+    if args.get('experiment_manifest'):
+        from scripts.pact_workflow import load_contract, check_dataset_files, resolve
+        experiment = load_contract(args['experiment_manifest'])
+        check_dataset_files(experiment)
+        if is_eval:
+            raise ValueError('Use scripts/pact.py eval for contract-bound robot evaluation')
+        is_sim = False
+        task_config = dict(experiment['profile'])
+        task_config.update(dataset_dir=str(resolve(task_config['data_dir'])),
+                           num_episodes=len(experiment['episodes']),
+                           episode_len=max(e['length'] for e in experiment['episodes']))
+    elif is_sim:
         from constants import SIM_TASK_CONFIGS
         task_config = SIM_TASK_CONFIGS[task_name]
     else:
@@ -66,21 +78,20 @@ def main(args):
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
-    # fixed parameters
-    if task_name in ['test', 'proximity_learning']:  # Your custom tasks
-        state_dim = 9  # Your robot has 9 joints
-        action_dim = state_dim
-    elif task_name in ('pla_house1_mug', 'pla_smoke', 'pla_house1_mug_random',
-                       'pla_house3_mug_random', 'pla_houses_1_3_mug_random',
-                       'obstacle_baseline', 'obstacle_pact', 'obstacle_pact_v2',
-                       'obstacle_pact_avoid_v1', 'obstacle_gate_v1',
-                       'pact_place_corridor_v5'):
-        # Franka skin: qpos = arm(7) + 2 finger joints; action = arm(7) + 1 gripper cmd
-        state_dim = 9
-        action_dim = 8
+    # Robot dims. sim_* = ALOHA bimanual (14/14). Every TASK_CONFIGS row is Franka
+    # FR3: qpos 9 (arm7 + 2 fingers), action 8 (arm7 + 1 gripper). Do not fall
+    # through to 14 — that builds Linear(14, 512) and dies on hdf5 actions (T, 8)
+    # with RuntimeError: 400x8 vs 14x512.
+    if is_sim:
+        state_dim = 14
+        action_dim = 14
     else:
-        state_dim = 14  # Default for other tasks
-        action_dim = state_dim
+        state_dim = int(task_config.get('state_dim', 9))
+        action_dim = int(task_config.get('action_dim', 8))
+    print(
+        f"[dims] task={task_name} state_dim={state_dim} action_dim={action_dim} "
+        f"cameras={camera_names}"
+    )
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -222,7 +233,9 @@ def main(args):
     # --ckpt_dir is treated as the root (default 'ckpts'). Eval keeps the exact dir passed.
     if not is_eval:
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        ckpt_dir = os.path.join(ckpt_dir, task_name, f"{timestamp}_{wandb_run_name}")
+        ckpt_dir = args.get('run_dir') or os.path.join(ckpt_dir, task_name, f"{timestamp}_{wandb_run_name}")
+        if args.get('run_dir') and os.path.isdir(ckpt_dir) and os.listdir(ckpt_dir):
+            raise ValueError(f'Refusing to overwrite nonempty run: {ckpt_dir}')
         print(f"[ckpt] saving this run to {ckpt_dir}")
 
     config = {
@@ -275,11 +288,19 @@ def main(args):
         proximity_layout=prox_layout_data,
         n_proximity_sensors=policy_config.get('n_proximity_sensors', 0) if use_proximity else 0,
         proximity_feature_dim=policy_config.get('prox_feat_dim', 3) if use_proximity else 3,
+        split=experiment['split'] if experiment else None,
     )
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
+    if experiment:
+        from scripts.pact_workflow import write_json
+        write_json(Path(ckpt_dir) / 'experiment.json', experiment)
+        write_json(Path(ckpt_dir) / 'training_config.json', {
+            'arguments': args, 'policy_config': policy_config,
+            'experiment_sha256': experiment['sha256'],
+        })
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
@@ -815,6 +836,8 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
+    parser.add_argument('--experiment_manifest', type=str, default=None)
+    parser.add_argument('--run_dir', type=str, default=None)
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--ckpt_dir', action='store', type=str, default='ckpts',
                         help='ckpt root; a run saves to <ckpt_dir>/<task>/<datetime>_<runname>/')

@@ -132,6 +132,26 @@ TASK_CONFIGS = {
         'episode_len': 636,
         'camera_names': ['wrist_camera'],
     },
+    'pact_pick_n_place_v2': {
+        # v10.11d four-object place (data/pact_pick_n_place_v2/data/v1011d).
+        # 200 accepted demos. Table RGB is exo_camera_1 + wrist. 40-sensor skin
+        # in /observations/proximity. Env pact_place_corridor_v10_11d. Convert:
+        #   python -m scripts.convert_pact_place_to_act \
+        #       --src data/pact_pick_n_place_v2/data/v1011d \
+        #       --dst act_style_data/pact_pick_n_place_v2/data/v1011d \
+        #       --with_proximity --prox_pool min --image_h 240 --image_w 320 \
+        #       --task_name pact_pick_n_place_v2
+        # Converted 2026-09-03: 200/200, max T=559, sides left=100 right=100.
+        # hdf5 keys: exo_camera_1 + wrist_camera. Franka dims: qpos 9, action 8.
+        # Eval: eval_act_pact_pick_n_place.py (V1010 sampler, v10_7 XMLs,
+        # origin/main worktree). Not eval_act_place_corridor.py.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v1011d'),
+        'num_episodes': 200,
+        'episode_len': 561,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants

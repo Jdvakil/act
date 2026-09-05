@@ -64,13 +64,17 @@ def _detr_argv(ckpt_dir: str):
         sys.argv = orig
 
 
-def build_policy(ckpt_dir: Path, device: str = "cuda"):
+def build_policy(ckpt_dir: Path, device: str = "cuda", *, camera_names=None,
+                 ckpt_name: str = "policy_best.ckpt"):
     """Rebuild the trained ACTPolicy exactly as eval does (proximity iff prox_config.json)."""
     prox_path = ckpt_dir / "prox_config.json"
     pcfg = json.loads(prox_path.read_text()) if prox_path.exists() else None
-    cfg = dict(lr=1e-5, num_queries=100, kl_weight=10, hidden_dim=512,
+    state = torch.load(ckpt_dir / ckpt_name, map_location="cpu", weights_only=True)
+    chunk_size = int(state["model.query_embed.weight"].shape[0])
+    cfg = dict(lr=1e-5, num_queries=chunk_size, kl_weight=10, hidden_dim=512,
                dim_feedforward=3200, lr_backbone=1e-5, backbone="resnet18",
-               enc_layers=4, dec_layers=7, nheads=8, camera_names=list(CAM_NAMES),
+               enc_layers=4, dec_layers=7, nheads=8,
+               camera_names=list(CAM_NAMES if camera_names is None else camera_names),
                state_dim=9, action_dim=8)
     extractor = None
     if pcfg:
@@ -92,7 +96,7 @@ def build_policy(ckpt_dir: Path, device: str = "cuda"):
         cfg["prox_feat_dim"] = extractor.act_feat_dim
     with _detr_argv(ckpt_dir):
         policy = ACTPolicy(cfg)
-    policy.load_state_dict(torch.load(ckpt_dir / "policy_best.ckpt", map_location=device))
+    policy.load_state_dict(state)
     policy.to(device).eval()
     stats = pickle.load(open(ckpt_dir / "dataset_stats.pkl", "rb"))
     n_prox = (cfg.get("n_proximity_sensors", 0) or 0) * (cfg.get("prox_tokens_per_sensor", 1) or 1)
