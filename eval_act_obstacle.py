@@ -149,6 +149,7 @@ class ACTInferencePolicy(InferencePolicy):
         self._stats = None
         self._prox_encoder = None  # P+ACT skin encoder (frozen or finetuned)
         self._prox_hist: list[np.ndarray] = []
+        self._prox_hist_step = None
         self._prox_pcfg: dict | None = None
         self.gripper_close_commanded = False
 
@@ -160,6 +161,7 @@ class ACTInferencePolicy(InferencePolicy):
         self._step = 0
         self._pending_chunks.clear()
         self._prox_hist = []
+        self._prox_hist_step = None
         self.gripper_close_commanded = False
 
     def prepare_model(self, model_name: str | None = None) -> None:
@@ -191,7 +193,7 @@ class ACTInferencePolicy(InferencePolicy):
             if pcfg_path.is_file():
                 self._prox_pcfg = json.loads(pcfg_path.read_text())
                 load_kwargs = resolve_act_encoder_load(
-                    pc.ckpt_dir, self._prox_pcfg, ckpt or ""
+                    pc.ckpt_dir, self._prox_pcfg, ckpt or "", policy_name=pc.ckpt_name
                 )
             else:
                 load_kwargs = {
@@ -234,6 +236,10 @@ class ACTInferencePolicy(InferencePolicy):
 
         pc = self.pc
         stats = self._stats
+
+        # Training uses consecutive control frames, including steps whose action
+        # comes from a cached chunk. Record skin BEFORE that early return.
+        self.record_proximity_observation(obs)
 
         # --temp_agg_off = standard ACT open-loop chunking: query the policy once,
         # execute the WHOLE chunk, re-query only when it is exhausted. Re-querying
@@ -297,8 +303,6 @@ class ACTInferencePolicy(InferencePolicy):
                       f"min={prox_np.min():.3f}m max={prox_np.max():.3f}m")
             prox_t = torch.from_numpy(prox_np).float().cuda().unsqueeze(0)  # (1,40,8,8)
             if is_geometry_feature(pc.prox_feature):
-                self._prox_hist.append(prox_np)
-                self._prox_hist = self._prox_hist[-8:]
                 hist = np.stack(self._prox_hist, axis=0)
                 proximity_positions = encode_for_act(
                     self._prox_encoder, torch.from_numpy(hist).float().cuda().unsqueeze(0)
@@ -343,14 +347,24 @@ class ACTInferencePolicy(InferencePolicy):
             self.gripper_close_commanded = True
         return {"arm": arm, "gripper": np.asarray([gripper], dtype=np.float32)}
 
-    def needs_fresh_policy_observation(self) -> bool:
-        """True iff the next ``inference_model`` call will read cameras / skin.
+    def record_proximity_observation(self, obs):
+        if (self._prox_encoder is not None and is_geometry_feature(self.pc.prox_feature)
+                and self._prox_hist_step != self._step):
+            frame = stack_obs_proximity(obs, self._prox_encoder.sensor_order, pool=self._prox_pool)
+            self._prox_hist.append(np.array(frame, copy=True))
+            self._prox_hist = self._prox_hist[-8:]
+            self._prox_hist_step = self._step
 
-        With ``--temp_agg_off`` the policy keeps an open-loop chunk and ignores
-        observations until that chunk is exhausted. Rendering 40 proximity
-        cameras on those idle steps is wasted EGL (~0.75 s/step, ~12 h / 50).
-        Gating renders to query steps is bit-identical for the executed action.
-        """
+    def needs_fresh_policy_observation(self) -> bool:
+        """Legacy gates must retain skin on every step for a history encoder."""
+        return self.needs_fresh_camera_observation() or self.needs_fresh_proximity_observation()
+
+    def needs_fresh_proximity_observation(self) -> bool:
+        return bool(self.pc.use_proximity and (
+            is_geometry_feature(self.pc.prox_feature) or self.needs_fresh_camera_observation()))
+
+    def needs_fresh_camera_observation(self) -> bool:
+        """RGB and the network are consumed only when the action chunk expires."""
         if not self.pc.temp_agg_off:
             return True
         if not self._pending_chunks:

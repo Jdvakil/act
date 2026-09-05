@@ -1,4 +1,4 @@
-"""Contract-bound ACT/raw-PACT evaluator. Invoke through scripts/pact.py."""
+"""Contract-bound ACT, raw-PACT and finetuned PACT-readout evaluator."""
 from __future__ import annotations
 import argparse
 import hashlib
@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from pact_workflow import digest, file_digest, load_contract, resolve, write_json
 from pact import verify_runtime
+from pact_checkpoint import paired_encoder_checkpoint
 from pact_eval_protocol import rollout, summarize
 
 
@@ -39,8 +40,13 @@ def identity(args, contract):
     paths = [checkpoint, args.checkpoint_dir / 'dataset_stats.pkl']
     paths += [p for p in (args.checkpoint_dir / 'prox_config.json',
                           args.checkpoint_dir / 'training_config.json') if p.exists()]
+    prox_path = args.checkpoint_dir / 'prox_config.json'
+    if prox_path.exists():
+        encoder = paired_encoder_checkpoint(args.checkpoint_dir, json.loads(prox_path.read_text()), args.checkpoint_name)
+        if encoder is not None:
+            paths.append(encoder)
     code = [Path(__file__), ROOT / 'scripts/pact_eval_protocol.py', ROOT / 'scripts/pact_workflow.py',
-            ROOT / 'scripts/pact.py', Path(__file__).with_name('eval_place_fast_hooks.py'),
+            ROOT / 'scripts/pact.py', ROOT / 'scripts/pact_checkpoint.py', Path(__file__).with_name('eval_place_fast_hooks.py'),
             Path(__file__).with_name('eval_act_obstacle.py'), Path(__file__).with_name('policy.py')]
     code += sorted((ROOT / 'encoders').rglob('*.py'))
     code += sorted((ROOT / 'submodules/act/detr').rglob('*.py'))
@@ -57,10 +63,35 @@ def identity(args, contract):
                'code': {str(p.relative_to(ROOT)): file_digest(p) for p in code},
                'scenes': {p.name: file_digest(p) for p in scenes},
                'runtime': file_digest(resolve(contract['profile']['runtime_dir']) / 'runtime.json'),
-               'protocol': 'ever_success_full_horizon_v1', 'proximity': 'native_egl_substeps_min',
+               'protocol': 'ever_success_full_horizon_v2', 'proximity': 'native_egl_substeps_min',
+               'geometry_history': 'consecutive_control_steps_v1',
                'python': sys.version, 'platform': sys.platform, 'package_versions': versions}
     payload['sha256'] = digest(payload)
     return payload
+
+
+def configure_proximity(pc, directory, policy_name, contract):
+    path = directory / 'prox_config.json'
+    if not path.exists():
+        return
+    prox = json.loads(path.read_text())
+    feature = prox.get('prox_feature')
+    if feature not in ('raw', 'peak_closeness'):
+        expected = {'prox_feature': 'surface_embedding', 'finetune_prox_encoder': True,
+                    'prox_policy_tap': 'readout', 'prox_feat_dim': 128,
+                    'n_proximity_sensors': 40, 'prox_tokens_per_sensor': 1,
+                    'prox_layout': 'per_sensor', 'proximity_layout': 'raw_causal'}
+        for key, value in expected.items():
+            if prox.get(key) != value:
+                raise ValueError(f'Unsupported readout configuration: {key} must be {value!r}')
+        pc.prox_encoder_ckpt = str(paired_encoder_checkpoint(directory, prox, policy_name))
+        pc.finetune_prox_encoder = True
+        pc.prox_policy_tap = 'readout'
+    if prox.get('prox_pool') != contract['prox_pool']:
+        raise ValueError('Checkpoint proximity pooling differs from data')
+    pc.use_proximity = True
+    for key in ('prox_feature', 'prox_layout', 'prox_pool', 'prox_tokens_per_sensor'):
+        setattr(pc, key, prox[key])
 
 
 def configure(args, contract, row):
@@ -79,7 +110,7 @@ def configure(args, contract, row):
     cfg.end_on_success = False
     if hasattr(cfg, 'terminate_upon_success'):
         cfg.terminate_upon_success = False
-    if profile['adapter'] == 'v1011d':
+    if profile['adapter'] in ('v1011d', 'v12'):
         cfg.camera_config = FrankaSkinHybridCameraSystem()
     cfg.proximity_sensor_period_ms = 16.6667
     cfg.viz_sensor_rgb = False
@@ -89,12 +120,16 @@ def configure(args, contract, row):
     cfg.robot_config.action_noise_config.enabled = False
     cfg.task_sampler_config.task_sampler_class = getattr(enclosure_reach, profile['sampler_class'])
     pinned_scenes = resolve(profile['runtime_dir']) / 'molmo_spaces/data_generation/custom_scenes'
-    if profile['adapter'] == 'v1011d':
+    if profile['adapter'] in ('v1011d', 'v12'):
         for filename in ('pact_place_corridor_v5.xml', 'pact_place_corridor_v3.xml'):
             if file_digest(ROOT / 'custom_scenes' / filename) != file_digest(pinned_scenes / filename):
                 raise ValueError(f'Scene include differs from pinned runtime: {filename}')
         assert_v1010_scene_hashes(ROOT / 'custom_scenes')
         scene = ROOT / 'custom_scenes' / V1010_SCENE_BY_POSE[row['pose_id']]['filename']
+        if profile['adapter'] == 'v12':
+            scene = pinned_scenes / profile['scene_filename']
+            if file_digest(scene) != profile['scene_sha256'] or row['pact_v106_scene_sha256'] != profile['scene_sha256']:
+                raise ValueError('v12 preview scene differs from collection')
     else:
         scene = pinned_scenes / 'pact_place_corridor_v2.xml'
     cfg.task_sampler_config.scene_xml_paths = [str(scene)] * 2
@@ -120,16 +155,7 @@ def configure(args, contract, row):
         pc.chunk_size = policy_config['num_queries']
         if pc.chunk_size != checkpoint_chunk:
             raise ValueError('Checkpoint chunk shape differs from saved architecture')
-    prox_path = args.checkpoint_dir / 'prox_config.json'
-    if prox_path.exists():
-        prox = json.loads(prox_path.read_text())
-        if prox.get('prox_feature') not in ('raw', 'peak_closeness'):
-            raise ValueError('This contract adapter currently supports ACT and raw PACT; geometry history needs a separate validated adapter')
-        if prox.get('prox_pool') != contract['prox_pool']:
-            raise ValueError('Checkpoint proximity pooling differs from data')
-        pc.use_proximity = True
-        for key in ('prox_feature', 'prox_layout', 'prox_pool', 'prox_tokens_per_sensor'):
-            setattr(pc, key, prox[key])
+    configure_proximity(pc, args.checkpoint_dir, args.checkpoint_name, contract)
     # Keep policy camera geometry/resolution unchanged from collection. Reference
     # also keeps annotations and unused depth for comparison with the original.
     if not args.reference:
@@ -152,7 +178,8 @@ def worker(args, contract, row, run_identity):
     from utils import set_seed
     from eval_act_obstacle import ACTInferencePolicy
     from eval_place_fast_hooks import _install_metrics_only_sensor_filter, _install_contract_sensor_gate
-    from molmo_spaces.tasks.pact_place_contact_audit import PactPlaceContactAudit, place_environment_contact_pairs, classify_contact
+    from molmo_spaces.tasks import pact_place_contact_audit as contact_module
+    from molmo_spaces.tasks.pact_place_contact_audit import PactPlaceContactAudit, place_environment_contact_pairs
     from molmo_spaces.data_generation.runtime_compat import assert_supported_runtime
     assert_supported_runtime(strict=True)
     torch.backends.cudnn.benchmark = False
@@ -166,6 +193,10 @@ def worker(args, contract, row, run_identity):
               'reference': args.reference, 'row': row, 'runtime_verification': bool(args.verify_horizon)}
     started = time.perf_counter()
     try:
+        v12_overlay = None
+        if contract['profile']['adapter'] == 'v12':
+            from pact_v12_adapter import install_sampler_overlay, apply_overlay
+            v12_overlay = install_sampler_overlay(sampler, runtime)
         # No policy-dependent retries or replacement of failed episodes. A failed
         # scene is an explicit infrastructure failure; fix the suite deliberately.
         set_seed(row['task_seed_u32'])
@@ -174,6 +205,8 @@ def worker(args, contract, row, run_identity):
         task = sampler.sample_task(house_index=row['scene_template_house_index'])
         if task is None:
             raise ValueError('Sampler returned no task')
+        if v12_overlay is not None:
+            record['overlay'] = apply_overlay(task, *v12_overlay)
         params = task.scene_params
         if params.get('pact_place_environment_version') != contract['profile']['environment_version']:
             raise ValueError('Realized environment differs from experiment')
@@ -181,7 +214,7 @@ def worker(args, contract, row, run_identity):
             raise ValueError('Evaluation world repeats a training/validation world')
         initial_contacts = list(place_environment_contact_pairs(task.env))
         forbidden = {'hazard_bar', 'other_environment', 'clutter', 'mounted_fixture'}
-        if any(classify_contact(c) in forbidden for c in initial_contacts):
+        if any(contact_module.classify_contact(c) in forbidden for c in initial_contacts):
             raise ValueError('Scene has forbidden robot/environment contact before the policy starts')
         policy = ACTInferencePolicy(cfg, task)
         policy.prepare_model()
@@ -205,8 +238,11 @@ def worker(args, contract, row, run_identity):
         original_inference = policy.inference_model
         def inference(obs):
             if policy.needs_fresh_policy_observation() and args.verify_horizon:
-                keys = list(cfg.policy_config.camera_names) + ['qpos']
-                keys += sorted(k for k in obs if k.startswith('proximity_')) if cfg.policy_config.use_proximity else []
+                keys = ['qpos']
+                if policy.needs_fresh_camera_observation():
+                    keys += list(cfg.policy_config.camera_names)
+                if policy.needs_fresh_proximity_observation():
+                    keys += list(policy._prox_encoder.sensor_order)
                 h = hashlib.sha256()
                 def add(value):
                     if isinstance(value, dict):
@@ -335,6 +371,10 @@ def main():
         records.append(execute(i, args.reference, args.suite + ('_reference' if args.reference else '')))
         report = summarize(records, len(rows))
         report.update(identity=run_identity['sha256'], suite=args.suite,
+                      dataset=contract['dataset'],
+                      evaluation_variant=contract['profile'].get('dataset_environment_version', contract['profile']['environment_version']),
+                      sampler_class=contract['profile']['sampler_class'],
+                      proximity_backend='native_egl_substeps_min', task_horizon=contract['profile']['horizon'],
                       reference=args.reference, success_definition='ever_success',
                       collision_window='full_horizon', session_wall_seconds=time.perf_counter() - started)
         write_json(output / (args.suite + ('_reference' if args.reference else '') + '.json'), report)

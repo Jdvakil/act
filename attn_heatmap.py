@@ -87,7 +87,7 @@ def build_policy(ckpt_dir: Path, device: str = "cuda", *, camera_names=None,
             device=device,
             layout=pcfg.get("prox_layout", "global"),
             tokens_per_sensor=k,
-            **resolve_act_encoder_load(ckpt_dir, pcfg),
+            **resolve_act_encoder_load(ckpt_dir, pcfg, policy_name=ckpt_name),
         )
         if extractor is not None:
             extractor.eval()

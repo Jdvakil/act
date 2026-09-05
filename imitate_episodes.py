@@ -216,6 +216,10 @@ def main(args):
             'prox_encoder_finetuned': 'prox_encoder_best.pt' if finetune_prox else '',
             'prox_encoder_lr': args.get('prox_encoder_lr'),
         }
+        if finetune_prox:
+            from scripts.pact_checkpoint import file_digest
+            prox_cfg_json['pretrained_encoder_sha256'] = file_digest(prox_ckpt)
+            prox_cfg_json['history_sampling'] = 'consecutive_control_steps_v1'
         print(f"[P+ACT] proximity fusion ON: feature={prox_feature} layout={prox_encoder.layout} "
               f"n_sensors={prox_encoder.n_act_sensors} feat_dim={prox_encoder.act_feat_dim} "
               f"K={prox_K} pool={prox_pool} data={prox_layout_data} ckpt={prox_ckpt} "
@@ -316,7 +320,8 @@ def main(args):
 
     # save best checkpoint
     ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+    _save_policy_pair(ckpt_path, best_state_dict,
+                      config['prox_encoder'] if config['finetune_prox_encoder'] else None)
     print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
 
 
@@ -623,6 +628,23 @@ def _save_prox_encoder(path, prox_encoder):
     )
 
 
+def _save_policy_pair(path, state, encoder=None):
+    """Persist a policy and its same-update encoder, then record their hashes."""
+    torch.save(state, path)
+    if encoder is None:
+        return
+    from scripts.pact_checkpoint import encoder_filename, file_digest
+    from scripts.pact_workflow import write_json
+    path = Path(path)
+    encoder_path = path.with_name(encoder_filename(path.name))
+    _save_prox_encoder(encoder_path, encoder)
+    index = path.with_name('checkpoint_pairs.json')
+    pairs = json.loads(index.read_text()) if index.exists() else {}
+    pairs[path.name] = {'encoder': encoder_path.name, 'policy_sha256': file_digest(path),
+                        'encoder_sha256': file_digest(encoder_path)}
+    write_json(index, pairs)
+
+
 def train_bc(train_dataloader, val_dataloader, config):
     num_epochs = config['num_epochs']
     ckpt_dir = config['ckpt_dir']
@@ -787,15 +809,12 @@ def train_bc(train_dataloader, val_dataloader, config):
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            torch.save(policy.state_dict(), ckpt_path)
-            if finetune_prox:
-                _save_prox_encoder(os.path.join(ckpt_dir, 'prox_encoder.pt'), prox_encoder)
+            _save_policy_pair(ckpt_path, policy.state_dict(), prox_encoder if finetune_prox else None)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    _save_policy_pair(ckpt_path, policy.state_dict(), prox_encoder if finetune_prox else None)
     if finetune_prox:
-        _save_prox_encoder(os.path.join(ckpt_dir, 'prox_encoder.pt'), prox_encoder)
         if best_encoder_state is not None:
             prox_encoder.inner.load_state_dict(best_encoder_state)
             _save_prox_encoder(
@@ -804,7 +823,7 @@ def train_bc(train_dataloader, val_dataloader, config):
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
     ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+    _save_policy_pair(ckpt_path, best_state_dict, prox_encoder if finetune_prox else None)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
     # save training curves

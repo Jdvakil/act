@@ -409,10 +409,10 @@ def _configure_eval_cameras(eval_cfg, *, need_skin: bool) -> None:
 
 
 def _install_contract_sensor_gate() -> None:
-    """Skip discarded raw-policy observations without changing sampled depths.
+    """Gate RGB by action queries; retain consecutive skin for readout policies.
 
     Unlike the legacy gate, preserve the native 60-Hz depth buffer on query
-    steps. Only history-free policies may use this gate. Never enable raycast
+    steps. History encoders keep the native buffer every control step. Never enable raycast
     replacement or reset a populated substep buffer before it is consumed.
     """
     from molmo_spaces.env.abstract_sensors import SensorSuite
@@ -423,24 +423,31 @@ def _install_contract_sensor_gate() -> None:
     if getattr(original_step, '_pact_contract_gate', False):
         return
 
+    def wants(task, modality):
+        policy = getattr(task, '_registered_policy', None)
+        method = getattr(policy, f'needs_fresh_{modality}_observation', None)
+        return bool(method()) if method is not None else _policy_wants_fresh(task)
+
     def get_observations(self, env, task, **kwargs):
         last = getattr(self, '_contract_last_observation', None)
-        fresh = _policy_wants_fresh(task)
+        fresh = wants(task, 'camera')
         if fresh or last is None:
             observations = original_observations(self, env, task, **kwargs)
             self._contract_last_observation = observations
             return observations
         observations = dict(last)
         for uuid, sensor in self.sensors.items():
-            if type(sensor).__name__ not in _RENDER_CLASS_NAMES:
+            if (type(sensor).__name__ not in _RENDER_CLASS_NAMES or
+                    (_is_prox_depth_sensor(sensor, ()) and wants(task, 'proximity'))):
                 observations[uuid] = sensor.get_observation(env=env, task=task, **kwargs)
+        self._contract_last_observation = observations
         return observations
 
     def step(self, *args, **kwargs):
         cameras = self._proximity_camera_names
         # policy.get_action has already advanced its step index. This decides
         # whether the observation returned by THIS step will be consumed next.
-        if not _policy_wants_fresh(self):
+        if not wants(self, 'proximity'):
             self._proximity_camera_names = []
         try:
             return original_step(self, *args, **kwargs)
