@@ -22,6 +22,72 @@ _RGB_DEPTH_OFF = frozenset({"wrist_camera", "exo_camera_1", "table_camera"})
 _EXPORT_SENSOR_CLASS_NAMES = frozenset({"ObjectImagePointsSensor", "EnvStateSensor"})
 
 
+def _install_deterministic_rgb_renderer() -> None:
+    """Use single-sample RGB framebuffers in both contract evaluation modes.
+
+    The RTX 4090 multisample resolve varies by one uint8 level even for repeated
+    renders of a frozen scene. Pin the RGB context at construction, then restore
+    the model setting so the separate native proximity renderer keeps its original
+    sampling configuration. No pinned runtime files or scene XML are edited.
+    """
+    import inspect
+    from molmo_spaces.env import env as env_module
+    from molmo_spaces.renderer.opengl_rendering import MjOpenGLRenderer
+
+    if env_module.HAS_FILAMENT:
+        raise ValueError('Contract RGB determinism requires the classic OpenGL renderer')
+    original = MjOpenGLRenderer.__init__
+    if getattr(original, '_pact_single_sample', False):
+        return
+    signature = inspect.signature(original)
+
+    def initialize(self, *args, **kwargs):
+        arguments = signature.bind(self, *args, **kwargs).arguments
+        model = arguments.get('model')
+        if model is None and arguments.get('model_bindings') is not None:
+            model = arguments['model_bindings'].model
+        if model is None:
+            raise ValueError('RGB renderer has no model to configure')
+        samples = model.vis.quality.offsamples
+        try:
+            model.vis.quality.offsamples = 0
+            original(self, *args, **kwargs)
+        finally:
+            model.vis.quality.offsamples = samples
+
+    initialize._pact_single_sample = True
+    MjOpenGLRenderer.__init__ = initialize
+
+
+def _install_v12_preview_settle_park(sampler, overlay):
+    """Park outbound v12 household before inherited settle overlap checks.
+
+    Collection parks Soap_Bottle_30 in the expert reset after sampling. ACT
+    evaluation has no expert reset, so the V1010 settle check still sees that
+    bottle on the table and can abort construction. Park it first and drop it
+    from the active-clutter list for the duration of settle so the check matches
+    the deployed one-bottle scene. The later overlay still applies kitchen extras
+    and the kept-bottle shift. Does not change seeds or drop failed rows.
+    """
+    original = sampler._settle_injected_object
+
+    def settle(env):
+        import mujoco
+        overlay._park_household(env.current_model, env.current_data)
+        mujoco.mj_forward(env.current_model, env.current_data)
+        original_names = list(sampler._pact_active_clutter_names)
+        sampler._pact_active_clutter_names = [
+            name for name in original_names if not overlay._is_parked_household(name)
+        ]
+        try:
+            return original(env)
+        finally:
+            sampler._pact_active_clutter_names = original_names
+
+    sampler._settle_injected_object = settle
+    return sampler
+
+
 def _without_export_sensors(sensors):
     """Remove dataset annotations unused by ACT inputs or the task's judges.
 

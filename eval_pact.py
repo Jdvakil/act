@@ -65,6 +65,7 @@ def identity(args, contract):
                'runtime': file_digest(resolve(contract['profile']['runtime_dir']) / 'runtime.json'),
                'protocol': 'ever_success_full_horizon_v2', 'proximity': 'native_egl_substeps_min',
                'geometry_history': 'consecutive_control_steps_v1',
+               'rgb_rendering': 'classic_opengl_single_sample_v1',
                'python': sys.version, 'platform': sys.platform, 'package_versions': versions}
     payload['sha256'] = digest(payload)
     return payload
@@ -165,6 +166,26 @@ def configure(args, contract, row):
     return cfg
 
 
+def observation_hashes(observation, keys):
+    """Preserve the full-input comparison and identify individual differing leaves."""
+    import numpy as np
+    combined = hashlib.sha256()
+    components = {}
+    def add(value, path):
+        if isinstance(value, dict):
+            for key in sorted(value):
+                combined.update(key.encode())
+                add(value[key], f'{path}.{key}')
+        else:
+            array = np.asarray(value)
+            payload = str((array.shape, array.dtype)).encode() + array.tobytes()
+            combined.update(payload)
+            components[path] = hashlib.sha256(payload).hexdigest()
+    for key in keys:
+        add(observation[key], key)
+    return combined.hexdigest(), components
+
+
 def worker(args, contract, row, run_identity):
     runtime = verify_runtime(contract['profile'])
     os.environ.setdefault('MUJOCO_GL', 'egl')
@@ -177,13 +198,15 @@ def worker(args, contract, row, run_identity):
     import torch
     from utils import set_seed
     from eval_act_obstacle import ACTInferencePolicy
-    from eval_place_fast_hooks import _install_metrics_only_sensor_filter, _install_contract_sensor_gate
+    from eval_place_fast_hooks import (_install_metrics_only_sensor_filter, _install_contract_sensor_gate,
+                                      _install_deterministic_rgb_renderer, _install_v12_preview_settle_park)
     from molmo_spaces.tasks import pact_place_contact_audit as contact_module
     from molmo_spaces.tasks.pact_place_contact_audit import PactPlaceContactAudit, place_environment_contact_pairs
     from molmo_spaces.data_generation.runtime_compat import assert_supported_runtime
     assert_supported_runtime(strict=True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    _install_deterministic_rgb_renderer()
     if not args.reference:
         _install_metrics_only_sensor_filter()
         _install_contract_sensor_gate()
@@ -197,6 +220,7 @@ def worker(args, contract, row, run_identity):
         if contract['profile']['adapter'] == 'v12':
             from pact_v12_adapter import install_sampler_overlay, apply_overlay
             v12_overlay = install_sampler_overlay(sampler, runtime)
+            _install_v12_preview_settle_park(sampler, v12_overlay[0])
         # No policy-dependent retries or replacement of failed episodes. A failed
         # scene is an explicit infrastructure failure; fix the suite deliberately.
         set_seed(row['task_seed_u32'])
@@ -205,6 +229,10 @@ def worker(args, contract, row, run_identity):
         task = sampler.sample_task(house_index=row['scene_template_house_index'])
         if task is None:
             raise ValueError('Sampler returned no task')
+        rgb_samples = int(task.env._renderer._mjr_context.offSamples)
+        if rgb_samples > 1:
+            raise ValueError(f'RGB context still uses multisampling: {rgb_samples}')
+        record['rgb_framebuffer_samples'] = rgb_samples
         if v12_overlay is not None:
             record['overlay'] = apply_overlay(task, *v12_overlay)
         params = task.scene_params
@@ -234,7 +262,7 @@ def worker(args, contract, row, run_identity):
         task._contact_audit_hook = audit
         # A clean reset must not consume a depth buffer left by scene setup.
         task.env.reset_proximity_depth_buffer(task._proximity_camera_names)
-        traces, inputs = [], []
+        traces, inputs, input_components = [], [], []
         original_inference = policy.inference_model
         def inference(obs):
             if policy.needs_fresh_policy_observation() and args.verify_horizon:
@@ -243,17 +271,9 @@ def worker(args, contract, row, run_identity):
                     keys += list(cfg.policy_config.camera_names)
                 if policy.needs_fresh_proximity_observation():
                     keys += list(policy._prox_encoder.sensor_order)
-                h = hashlib.sha256()
-                def add(value):
-                    if isinstance(value, dict):
-                        for k in sorted(value):
-                            h.update(k.encode()); add(value[k])
-                    else:
-                        a = np.asarray(value)
-                        h.update(str((a.shape, a.dtype)).encode()); h.update(a.tobytes())
-                for key in keys:
-                    add(obs[key])
-                inputs.append(h.hexdigest())
+                combined, components = observation_hashes(obs, keys)
+                inputs.append(combined)
+                input_components.append({'step': policy._step, 'hashes': components})
             return original_inference(obs)
         policy.inference_model = inference
         def trace(step, action, observation, success):
@@ -270,6 +290,7 @@ def worker(args, contract, row, run_identity):
                       realized_layout_sha256=params.get('pact_v1011_layout_sha256'),
                       gripper_close_commanded=policy.gripper_close_commanded,
                       trace=traces, policy_input_hashes=inputs,
+                      policy_input_components=input_components,
                       torch_version=torch.__version__)
     except Exception as error:
         record.update(status='error', error=f'{type(error).__name__}: {error}')
@@ -298,6 +319,44 @@ def compare(reference, optimized):
     return (reference['success'] == optimized['success'] and
             reference['terminal_success'] == optimized['terminal_success'] and
             reference['contact_audit'] == optimized['contact_audit'])
+
+
+def comparison_report(reference, optimized):
+    """Explain a failed strict comparison without relaxing its pass criterion."""
+    import numpy as np
+    report = {'passed': compare(reference, optimized),
+              'reference_status': reference['status'], 'optimized_status': optimized['status']}
+    if reference['status'] != 'complete' or optimized['status'] != 'complete':
+        report.update(reference_error=reference.get('error'), optimized_error=optimized.get('error'))
+        return report
+    left, right = reference['policy_input_hashes'], optimized['policy_input_hashes']
+    report['input_counts'] = [len(left), len(right)]
+    report['first_input_mismatch_index'] = next((i for i, (a, b) in enumerate(zip(left, right)) if a != b),
+                                               min(len(left), len(right)) if len(left) != len(right) else None)
+    components_a = reference.get('policy_input_components', [])
+    components_b = optimized.get('policy_input_components', [])
+    report['component_diagnostics_available'] = bool(components_a and components_b)
+    report['first_component_mismatch'] = None
+    for a, b in zip(components_a, components_b):
+        changed = sorted(k for k in a['hashes'].keys() | b['hashes'].keys()
+                         if a['hashes'].get(k) != b['hashes'].get(k))
+        if changed or a['step'] != b['step']:
+            report['first_component_mismatch'] = {'reference_step': a['step'],
+                                                 'optimized_step': b['step'], 'fields': changed}
+            break
+    report['trace_counts'] = [len(reference['trace']), len(optimized['trace'])]
+    report['numeric_differences'] = {}
+    for key in ('arm', 'gripper', 'qpos'):
+        differences = [(a['step'], float(np.max(np.abs(np.asarray(a[key]) - np.asarray(b[key])))))
+                       for a, b in zip(reference['trace'], optimized['trace'])]
+        report['numeric_differences'][key] = {
+            'first_step_above_1e_6': next((step for step, error in differences if error > 1e-6), None),
+            'max_absolute_difference': max((error for _, error in differences), default=0.0)}
+    report['success_flags_equal'] = (reference['success'] == optimized['success'] and
+                                     reference['terminal_success'] == optimized['terminal_success'] and
+                                     all(a['success'] == b['success'] for a, b in zip(reference['trace'], optimized['trace'])))
+    report['contact_audit_equal'] = reference['contact_audit'] == optimized['contact_audit']
+    return report
 
 
 def main():
@@ -355,12 +414,19 @@ def main():
         chunk = int(weights['model.query_embed.weight'].shape[0])
         del weights
         horizon = min(contract['profile']['horizon'], 2 * chunk + 1)
-        comparisons = []
-        for i in range(min(2, len(rows))):
+        comparisons, details = [], []
+        planned_pairs = min(2, len(rows))
+        for i in range(planned_pairs):
             reference = execute(i, True, 'verify_reference', horizon)
             optimized = execute(i, False, 'verify_optimized', horizon)
             comparisons.append(compare(reference, optimized))
-        report = {'passed': all(comparisons), 'identity': run_identity['sha256'],
+            details.append(comparison_report(reference, optimized))
+            if not comparisons[-1]:
+                print('Trace parity failed; stopping before further pairs.', flush=True)
+                break
+        report = {'passed': bool(planned_pairs) and len(comparisons) == planned_pairs and all(comparisons),
+                  'identity': run_identity['sha256'], 'planned_pairs': planned_pairs,
+                  'checked_pairs': len(comparisons), 'comparisons': details,
                   'rows': comparisons, 'horizon': horizon, 'scope': 'observation/action/state/contact parity; task solvability not certified'}
         write_json(verification, report)
         print(json.dumps(report, indent=2))
@@ -375,6 +441,7 @@ def main():
                       evaluation_variant=contract['profile'].get('dataset_environment_version', contract['profile']['environment_version']),
                       sampler_class=contract['profile']['sampler_class'],
                       proximity_backend='native_egl_substeps_min', task_horizon=contract['profile']['horizon'],
+                      rgb_rendering=run_identity['rgb_rendering'],
                       reference=args.reference, success_definition='ever_success',
                       collision_window='full_horizon', session_wall_seconds=time.perf_counter() - started)
         write_json(output / (args.suite + ('_reference' if args.reference else '') + '.json'), report)
