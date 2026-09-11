@@ -152,6 +152,39 @@ TASK_CONFIGS = {
         'action_dim': 8,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
+    'pact_place_corridor_v1010': {
+        # Four-object v10.10 (data/pact_place_corridor/data/v1010/accepted).
+        # Convert 2026-09-11: 215/215, max T=633, table_camera + wrist.
+        # Not exo_camera_1. Closed-loop eval not wired.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor/data/v1010/accepted'),
+        'num_episodes': 215,
+        'episode_len': 635,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['table_camera', 'wrist_camera'],
+    },
+    'pact_place_corridor_v107_spaced': {
+        # v10.6 spaced pendant (data/pact_place_corridor/data/v107_spaced/accepted).
+        # Convert 2026-09-11: 210/210, max T=615, table_camera + wrist.
+        # Closed-loop eval not wired.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor/data/v107_spaced/accepted'),
+        'num_episodes': 210,
+        'episode_len': 617,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['table_camera', 'wrist_camera'],
+    },
+    'pact_place_corridor_v10_11c_100': {
+        # Mixed v10.11c clutter geometry (taller primitives).
+        # Convert 2026-09-11: 99/99, max T=546, exo + wrist. Not v1011d.
+        # Closed-loop eval not wired.
+        'dataset_dir': str(ACT_DATA_DIR / 'mixed_v1011_clutter_geometry/pact_place_corridor_v10_11c_100'),
+        'num_episodes': 99,
+        'episode_len': 548,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants
