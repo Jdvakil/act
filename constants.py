@@ -185,6 +185,17 @@ TASK_CONFIGS = {
         'action_dim': 8,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
     },
+    'pact_pick_n_place_v2_v12': {
+        # v12.0 (data/pact_pick_n_place_v2/data/v12).
+        # Convert 2026-09-11: 165/165, max T=581, exo + wrist.
+        # Closed-loop eval not wired.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v12'),
+        'num_episodes': 165,
+        'episode_len': 583,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
 }
 
 ### Simulation envs fixed constants
