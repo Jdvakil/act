@@ -166,7 +166,7 @@ TASK_CONFIGS = {
     'pact_place_corridor_v107_spaced': {
         # v10.6 spaced pendant (data/pact_place_corridor/data/v107_spaced/accepted).
         # Convert 2026-09-11: 210/210, max T=615, table_camera + wrist.
-        # Closed-loop eval not wired.
+        # Closed-loop: eval_act_v107spaced.py. Not eval_act.py --task.
         'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor/data/v107_spaced/accepted'),
         'num_episodes': 210,
         'episode_len': 617,
@@ -181,6 +181,17 @@ TASK_CONFIGS = {
         'dataset_dir': str(ACT_DATA_DIR / 'mixed_v1011_clutter_geometry/pact_place_corridor_v10_11c_100'),
         'num_episodes': 99,
         'episode_len': 548,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pact_pick_n_place_v2_v1011d': {
+        # v10.11d (data/pact_pick_n_place_v2/data/v1011d).
+        # Convert 2026-09-03: 200/200, max T=559, exo + wrist.
+        # Closed-loop eval: repo-root eval_act_v1011d.py.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v1011d'),
+        'num_episodes': 200,
+        'episode_len': 561,
         'state_dim': 9,
         'action_dim': 8,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
