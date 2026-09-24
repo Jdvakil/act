@@ -199,13 +199,62 @@ TASK_CONFIGS = {
     'pact_pick_n_place_v2_v12': {
         # v12.0 (data/pact_pick_n_place_v2/data/v12).
         # Convert 2026-09-11: 165/165, max T=581, exo + wrist.
-        # Closed-loop eval not wired.
+        # Closed-loop eval: repo-root eval_act_place.py --env v12.
         'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v12'),
         'num_episodes': 165,
         'episode_len': 583,
         'state_dim': 9,
         'action_dim': 8,
         'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pact_pick_n_place_v2_v6': {
+        # v6 (data/pact_pick_n_place_v2/data/v6): V10.10 two-object, only the route
+        # bottles Soap_Bottle_30 (slot 01) and Soap_Bottle_11 (slot 06) live.
+        # Convert 2026-09-22: 200/200, max T=622, exo + wrist, sides 100/100.
+        # Closed-loop eval: repo-root eval_act_place.py --env v6.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v6'),
+        'num_episodes': 200,
+        'episode_len': 624,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pact_pick_n_place_v2_v107_spaced': {
+        # v107_spaced hub (data/pact_pick_n_place_v2/data/v107_spaced): 200 eps, exo + wrist.
+        # Not the 210-ep batman table_camera set 'pact_place_corridor_v107_spaced'.
+        # Convert 2026-09-22: 200/200, max T=620, sides 100/100.
+        # Closed-loop eval: repo-root eval_act_place.py --env v107_spaced.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_pick_n_place_v2/data/v107_spaced'),
+        'num_episodes': 200,
+        'episode_len': 622,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    },
+    'pact_place_corridor_v5_ext': {
+        # v5 ext (data/pact_place_corridor/data/v5/pick_and_place/accepted): 193 eps on the
+        # hallway corridor-v2 scene; episode IDs disjoint from the 152 Lundii v5 rows.
+        # Convert 2026-09-22: 193/193, max T=650, sides L101/R92. The hdf5 also carries
+        # table_camera (batman review render, pose not recorded); trained wrist-only so it
+        # runs on the hallway protocol. Closed-loop eval: eval_act.py --task hallway.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor/data/v5/pick_and_place/accepted'),
+        'num_episodes': 193,
+        'episode_len': 652,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['wrist_camera'],
+    },
+    'pact_place_corridor_v107': {
+        # v107 (data/pact_place_corridor/data/v107/pick_and_place/accepted): V10.7 asymmetric
+        # pendant + V9.5 clutter, 48 eps. Convert 2026-09-22 with --hold_half_rate_video
+        # (25/48 table mp4s recorded on even steps only), max T=609, sides L28/R20.
+        # Wrist-only (table_camera pose not recorded). No closed-loop evaluator.
+        'dataset_dir': str(ACT_DATA_DIR / 'pact_place_corridor/data/v107/pick_and_place/accepted'),
+        'num_episodes': 48,
+        'episode_len': 611,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['wrist_camera'],
     },
 }
 
