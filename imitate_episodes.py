@@ -116,6 +116,13 @@ def main(args):
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
                          'camera_names': camera_names, 'state_dim': state_dim,
                          'action_dim': action_dim}
+    elif policy_class == 'DP':
+        # Diffusion Policy baseline (dp_policy.py, 2026-10-17): cameras + qpos, no skin. Predicts
+        # dp_horizon actions, the evaluator executes the first chunk_size (ACT's 50) and re-plans.
+        policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone': backbone,
+                         'num_queries': args['chunk_size'], 'horizon': args.get('dp_horizon') or 56,
+                         'camera_names': camera_names, 'state_dim': state_dim,
+                         'action_dim': action_dim}
     else:
         raise NotImplementedError
 
@@ -272,6 +279,10 @@ def main(args):
         'prox_dropout_p': args.get('prox_dropout_p') or 0.0,
         'image_dropout_mode': args.get('image_dropout_mode') or 'all',
         'zero_latent_on_drop': not args.get('no_zero_latent_on_drop', False),
+        'amp': args.get('amp') or 'none',
+        'prox_noise_std': args.get('prox_noise_std') or 0.0,
+        'prox_noise_rel': args.get('prox_noise_rel') or 0.0,
+        'prox_pixel_dropout': args.get('prox_pixel_dropout') or 0.0,
     }
 
     if is_eval:
@@ -286,14 +297,32 @@ def main(args):
         print()
         exit()
 
+    is_dp = policy_class == 'DP'
+    dp_load = dict(train_repeat=int(args.get('dp_train_repeat') or 8),
+                   val_repeat=int(args.get('dp_val_repeat') or 2), val_fixed_seed=12345) if is_dp else {}
     train_dataloader, val_dataloader, stats, _ = load_data(
         dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-        args['chunk_size'], load_proximity=use_proximity,
+        policy_config['horizon'] if is_dp else args['chunk_size'], load_proximity=use_proximity,
         proximity_layout=prox_layout_data,
         n_proximity_sensors=policy_config.get('n_proximity_sensors', 0) if use_proximity else 0,
         proximity_feature_dim=policy_config.get('prox_feat_dim', 3) if use_proximity else 3,
         split=experiment['split'] if experiment else None,
+        **dp_load,
     )
+    if is_dp:
+        # DP scales actions to [-1, 1] by the per-dim min / max over the same episodes as the
+        # z-score stats (all of them, as get_norm_stats does without an explicit split).
+        import h5py
+        a_min, a_max = None, None
+        for i in range(num_episodes):
+            with h5py.File(os.path.join(dataset_dir, f'episode_{i}.hdf5'), 'r') as root:
+                a = root['/action'][()]
+            a_min = a.min(0) if a_min is None else np.minimum(a_min, a.min(0))
+            a_max = a.max(0) if a_max is None else np.maximum(a_max, a.max(0))
+        policy_config['dp_action_stats'] = {'z_mean': stats['action_mean'], 'z_std': stats['action_std'],
+                                            'a_min': a_min, 'a_max': a_max}
+        print(f'[DP] action min {np.round(a_min, 3).tolist()} max {np.round(a_max, 3).tolist()} '
+              f'horizon={policy_config["horizon"]} exec={policy_config["num_queries"]} {dp_load}')
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -314,6 +343,16 @@ def main(args):
     if prox_cfg_json is not None:
         with open(os.path.join(ckpt_dir, 'prox_config.json'), 'w') as f:
             json.dump(prox_cfg_json, f, indent=2)
+    # DP: everything eval needs to rebuild the network (eval_act_place.py -> scripts/pact_eval_dp.py
+    # switches to DiffusionPolicy when this file is in the checkpoint dir).
+    if policy_class == 'DP':
+        from dp_policy import DP_DEFAULTS
+        dp_cfg = dict(DP_DEFAULTS)
+        dp_cfg.update({k: v for k, v in policy_config.items() if k != 'dp_action_stats'})
+        dp_cfg.update(policy_class='DP', batch_size=batch_size_train, num_epochs=num_epochs, seed=args['seed'],
+                      **dp_load)
+        with open(os.path.join(ckpt_dir, 'dp_config.json'), 'w') as f:
+            json.dump(dp_cfg, f, indent=2, default=list)
 
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
@@ -330,6 +369,12 @@ def make_policy(policy_class, policy_config):
         policy = ACTPolicy(policy_config)
     elif policy_class == 'CNNMLP':
         policy = CNNMLPPolicy(policy_config)
+    elif policy_class == 'DP':
+        from dp_policy import DiffusionPolicy
+        stats = policy_config.get('dp_action_stats')
+        policy = DiffusionPolicy({k: v for k, v in policy_config.items() if k != 'dp_action_stats'})
+        if stats is not None:
+            policy.set_action_stats(**stats)
     else:
         raise NotImplementedError
     return policy
@@ -339,6 +384,8 @@ def make_optimizer(policy_class, policy):
     if policy_class == 'ACT':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'CNNMLP':
+        optimizer = policy.configure_optimizers()
+    elif policy_class == 'DP':
         optimizer = policy.configure_optimizers()
     else:
         raise NotImplementedError
@@ -520,6 +567,24 @@ def eval_bc(config, ckpt_name, save_episode=True):
     return success_rate, avg_return
 
 
+def noise_proximity(prox_data, std_abs=0.0, std_rel=0.0, pixel_dropout=0.0, max_range=4.0):
+    """Training-only ToF sensor-noise augmentation on raw skin depths in metres (2026-10-13).
+
+    depth + N(0, std_abs + std_rel * depth) per pixel, and with probability ``pixel_dropout`` a
+    pixel becomes a no-return (``max_range``), like a real multizone ToF zone that drops out.
+    Only raw depth layouts (ndim >= 4: (B, 40, 8, 8) or (B, H, 40, 8, 8)) are touched; already
+    encoded features pass through. Validation and eval always see clean readings.
+    """
+    if prox_data.ndim < 4 or (std_abs <= 0 and std_rel <= 0 and pixel_dropout <= 0):
+        return prox_data
+    d = prox_data
+    if std_abs > 0 or std_rel > 0:
+        d = d + torch.randn_like(d) * (std_abs + std_rel * d.clamp(min=0.0))
+    if pixel_dropout > 0:
+        d = torch.where(torch.rand_like(d) < pixel_dropout, torch.full_like(d, max_range), d)
+    return d.clamp(0.0, max_range)
+
+
 def blur_images(image_data, sigma):
     """FACTR visual curriculum: Gaussian-blur a (B, num_cam, C, H, W) 0-1 image batch.
 
@@ -573,7 +638,7 @@ def dropout_modalities(image_data, image_dropout_p, prox_dropout_p, mode='all'):
 
 def forward_pass(data, policy, prox_encoder=None, blur_sigma=0.0,
                  image_dropout_p=0.0, prox_dropout_p=0.0, dropout_mode='all',
-                 zero_latent_on_drop=True):
+                 zero_latent_on_drop=True, prox_noise=None):
     if len(data) == 5:
         # P+ACT: 5th element is raw (B, 40, 8, 8) proximity depths. The frozen
         # extractor turns it into the (B, 1, feat_dim) conditioning feature.
@@ -581,6 +646,8 @@ def forward_pass(data, policy, prox_encoder=None, blur_sigma=0.0,
         image_data, qpos_data, action_data, is_pad, prox_data = (
             image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda(), prox_data.cuda())
         image_data = blur_images(image_data, blur_sigma)
+        if prox_noise is not None and prox_data is not None:
+            prox_data = noise_proximity(prox_data, *prox_noise)
         # Modality dropout AFTER the blur so the curriculum math stays untouched
         # (blur of a constant fill would be the constant anyway).
         img_mask = prox_mask = None
@@ -676,6 +743,10 @@ def train_bc(train_dataloader, val_dataloader, config):
                 'prox_dropout_p': config.get('prox_dropout_p', 0.0),
                 'image_dropout_mode': config.get('image_dropout_mode', 'all'),
                 'zero_latent_on_drop': config.get('zero_latent_on_drop', True),
+                'amp': config.get('amp', 'none'),
+                'prox_noise_std': config.get('prox_noise_std', 0.0),
+                'prox_noise_rel': config.get('prox_noise_rel', 0.0),
+                'prox_pixel_dropout': config.get('prox_pixel_dropout', 0.0),
                 **{k: v for k, v in policy_config.items() if isinstance(v, (int, float, str, list, tuple, bool))},
             },
         )
@@ -685,6 +756,17 @@ def train_bc(train_dataloader, val_dataloader, config):
     policy = make_policy(policy_class, policy_config)
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
+    # DP: cosine LR with warmup (per optimizer step) and an EMA copy that is validated and saved.
+    dp_ema = dp_sched = None
+    if policy_class == 'DP':
+        from dp_policy import EMA, cosine_warmup_scheduler
+        total_steps = num_epochs * max(1, len(train_dataloader))
+        dp_sched = cosine_warmup_scheduler(optimizer, int(policy.cfg['warmup_steps']), total_steps)
+        dp_ema = EMA(policy, power=float(policy.cfg['ema_power']), max_decay=float(policy.cfg['ema_max_decay']))
+        n_par = sum(p.numel() for p in policy.parameters())
+        print(f"[DP] {n_par / 1e6:.1f} M params, {len(train_dataloader)} steps/epoch, {total_steps} steps total, "
+              f"lr={policy.cfg['lr']} lr_backbone={policy.cfg['lr_backbone']} EMA power={policy.cfg['ema_power']}")
+    eval_policy = dp_ema.averaged_model if dp_ema is not None else policy
     # P+ACT: skin encoder. Frozen by default; --finetune_prox_encoder adds it
     # to the optimizer and uses CLS readout tokens at train and eval.
     prox_encoder = config.get('prox_encoder')
@@ -737,6 +819,17 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
+    amp_on = config.get('amp', 'none') == 'bf16'
+    epoch_ckpt_every = int(os.environ.get('ACT_EPOCH_CKPT_EVERY', '100'))
+    prox_noise = (float(config.get('prox_noise_std') or 0.0), float(config.get('prox_noise_rel') or 0.0),
+                  float(config.get('prox_pixel_dropout') or 0.0))
+    if any(v > 0 for v in prox_noise):
+        print(f'[prox-noise] training-only skin noise: std_abs={prox_noise[0]} m, std_rel={prox_noise[1]}, '
+              f'pixel_dropout={prox_noise[2]}')
+    else:
+        prox_noise = None
+    if amp_on:
+        print('[amp] bf16 autocast ON for forward passes (params / optimizer / ckpts stay fp32)')
     best_encoder_state = None
     for epoch in tqdm(range(num_epochs)):
         print(f'\nEpoch {epoch}')
@@ -747,15 +840,18 @@ def train_bc(train_dataloader, val_dataloader, config):
                 prox_encoder.eval()
             epoch_dicts = []
             for batch_idx, data in enumerate(val_dataloader):
-                forward_dict = forward_pass(data, policy, prox_encoder)
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_on):
+                    forward_dict = forward_pass(data, eval_policy, prox_encoder)
                 epoch_dicts.append(forward_dict)
             epoch_summary = compute_dict_mean(epoch_dicts)
             validation_history.append(epoch_summary)
 
-            epoch_val_loss = epoch_summary['loss']
+            # DP: select on the EMA model's DDIM-sampled action L1 (the denoising MSE is noise-level
+            # dominated); ACT / CNNMLP: the validation loss as before.
+            epoch_val_loss = epoch_summary['l1_sample'] if dp_ema is not None else epoch_summary['loss']
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
-                best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
+                best_ckpt_info = (epoch, min_val_loss, deepcopy(eval_policy.state_dict()))
                 if finetune_prox:
                     best_encoder_state = deepcopy(prox_encoder.inner.state_dict())
                     _save_prox_encoder(
@@ -778,16 +874,21 @@ def train_bc(train_dataloader, val_dataloader, config):
             else:
                 blur_sigma = blur_sigma0 * max(0.0, 1.0 - global_step / blur_total_steps)
             global_step += 1
-            forward_dict = forward_pass(data, policy, prox_encoder, blur_sigma=blur_sigma,
-                                        image_dropout_p=image_dropout_p,
-                                        prox_dropout_p=prox_dropout_p,
-                                        dropout_mode=dropout_mode,
-                                        zero_latent_on_drop=zero_latent_on_drop)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_on):
+                forward_dict = forward_pass(data, policy, prox_encoder, blur_sigma=blur_sigma,
+                                            image_dropout_p=image_dropout_p,
+                                            prox_dropout_p=prox_dropout_p,
+                                            dropout_mode=dropout_mode,
+                                            zero_latent_on_drop=zero_latent_on_drop,
+                                            prox_noise=prox_noise)
             # backward
             loss = forward_dict['loss']
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            if dp_ema is not None:
+                dp_sched.step()
+                dp_ema.step(policy)
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
@@ -807,13 +908,15 @@ def train_bc(train_dataloader, val_dataloader, config):
                 log_dict[f'val/{k}'] = float(v.item())
             wandb.log(log_dict, step=epoch)
 
-        if epoch % 100 == 0:
+        # ACT_EPOCH_CKPT_EVERY (2026-10-13): periodic policy_epoch_* snapshots, 336 MB each.
+        # Default 100 = historical behaviour; 0 = none (best / last / best-epoch copy still saved).
+        if epoch_ckpt_every > 0 and epoch % epoch_ckpt_every == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
-            _save_policy_pair(ckpt_path, policy.state_dict(), prox_encoder if finetune_prox else None)
+            _save_policy_pair(ckpt_path, eval_policy.state_dict(), prox_encoder if finetune_prox else None)
             plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
-    _save_policy_pair(ckpt_path, policy.state_dict(), prox_encoder if finetune_prox else None)
+    _save_policy_pair(ckpt_path, eval_policy.state_dict(), prox_encoder if finetune_prox else None)
     if finetune_prox:
         if best_encoder_state is not None:
             prox_encoder.inner.load_state_dict(best_encoder_state)
@@ -873,6 +976,14 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+
+    # for DP (Diffusion Policy baseline, dp_policy.py)
+    parser.add_argument('--dp_horizon', type=int, default=56,
+                        help='DP prediction horizon (divisible by 4); the first --chunk_size are executed.')
+    parser.add_argument('--dp_train_repeat', type=int, default=8,
+                        help='DP: random windows drawn per train episode per epoch (ACT draws 1).')
+    parser.add_argument('--dp_val_repeat', type=int, default=2,
+                        help='DP: fixed (seeded) windows per val episode, the same every epoch.')
 
     # P+ACT (PACT): proximity-CVAE fusion. OFF by default -> vanilla ACT.
     parser.add_argument('--use_proximity', action='store_true',
@@ -949,6 +1060,21 @@ if __name__ == '__main__':
                         help='Ablation: do NOT zero the CVAE style latent z on vision-'
                              'dropped samples (leaves the action-chunk z-leakage path '
                              'open and disables the split-L1 diagnostics).')
+
+    # Mixed precision (opt-in, 2026-10-13). bf16 autocast on the forward pass only (train and
+    # val); parameters, optimizer state and saved checkpoints stay fp32, so eval is unchanged.
+    # Default 'none' keeps every earlier run's recipe byte-for-byte.
+    parser.add_argument('--amp', type=str, default='none', choices=('none', 'bf16'),
+                        help="'bf16' = torch.autocast(cuda, bfloat16) around forward_pass "
+                             "(~faster on RTX 4090). 'none' (default) = fp32 as before.")
+
+    # Training-only skin sensor-noise augmentation (2026-10-13; defaults off = earlier runs unchanged).
+    parser.add_argument('--prox_noise_std', type=float, default=0.0,
+                        help='Gaussian noise floor on raw skin depths, metres (training only).')
+    parser.add_argument('--prox_noise_rel', type=float, default=0.0,
+                        help='Extra Gaussian noise proportional to depth (0.02 = 2 percent).')
+    parser.add_argument('--prox_pixel_dropout', type=float, default=0.0,
+                        help='Probability a skin pixel reads no-return during training.')
 
     # wandb — on by default; opt out with --no_wandb. Run name auto-built as
     # taskname_numepochs_chunk_lr_seed unless --wandb_run_name overrides it.

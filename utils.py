@@ -147,6 +147,34 @@ class EpisodicDataset(torch.utils.data.Dataset):
         return prox[start_ts]
 
 
+class RepeatDataset(torch.utils.data.Dataset):
+    """DP (2026-10-17): each episode `repeat` times per epoch. EpisodicDataset draws a random start_ts
+    per item, so every repeat is a fresh window. fixed_seed: item i always draws with numpy seed
+    fixed_seed + i (the same validation windows every epoch)."""
+
+    def __init__(self, base, repeat=1, fixed_seed=None):
+        self.base, self.repeat, self.fixed_seed = base, max(1, int(repeat)), fixed_seed
+        self.is_sim = base.is_sim
+
+    def __len__(self):
+        return len(self.base) * self.repeat
+
+    def __getitem__(self, i):
+        if self.fixed_seed is None:
+            return self.base[i % len(self.base)]
+        state = np.random.get_state()
+        np.random.seed(int(self.fixed_seed) + int(i))
+        try:
+            return self.base[i % len(self.base)]
+        finally:
+            np.random.set_state(state)
+
+
+def _seed_numpy_worker(worker_id):
+    # Distinct numpy streams per loader worker (forked workers otherwise share one numpy state).
+    np.random.seed(torch.initial_seed() % (2 ** 32))
+
+
 def get_norm_stats(dataset_dir, num_episodes, episode_ids=None):
     all_qpos_data = []
     all_action_data = []
@@ -182,7 +210,8 @@ def get_norm_stats(dataset_dir, num_episodes, episode_ids=None):
 def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, num_queries,
               load_proximity=False, proximity_layout="raw",
               n_proximity_sensors=0, proximity_feature_dim=3,
-              expected_proximity_encoder_sha256=None, split=None):
+              expected_proximity_encoder_sha256=None, split=None,
+              train_repeat=1, val_repeat=1, val_fixed_seed=None):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     if split is None:
@@ -217,8 +246,23 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
                                   n_proximity_sensors=n_proximity_sensors,
                                   proximity_feature_dim=proximity_feature_dim,
                                   expected_proximity_encoder_sha256=expected_proximity_encoder_sha256)
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
+    # Loader parallelism only (same samples, same distribution). One worker + prefetch 1 is the
+    # historical setting and stays the default; ACT_LOADER_WORKERS=4 (2026-10-13) lifts the
+    # per-process HDF5 read bottleneck when several trainings share the GPU.
+    n_workers = max(1, int(os.environ.get('ACT_LOADER_WORKERS', '1')))
+    prefetch = 1 if n_workers == 1 else 2
+    if n_workers != 1:
+        print(f'[data] ACT_LOADER_WORKERS={n_workers} prefetch_factor={prefetch}')
+    # DP only (defaults keep ACT's loaders byte-for-byte): repeated / fixed windows, seeded workers.
+    dp_extra = {}
+    if train_repeat != 1 or val_repeat != 1 or val_fixed_seed is not None:
+        train_dataset = RepeatDataset(train_dataset, train_repeat)
+        val_dataset = RepeatDataset(val_dataset, val_repeat, fixed_seed=val_fixed_seed)
+        dp_extra = {'worker_init_fn': _seed_numpy_worker}
+        print(f'[data] DP windows: train x{train_repeat} ({len(train_dataset)}/epoch), '
+              f'val x{val_repeat} fixed seed {val_fixed_seed} ({len(val_dataset)})')
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=n_workers, prefetch_factor=prefetch, persistent_workers=n_workers > 1, **dp_extra)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=n_workers, prefetch_factor=prefetch, persistent_workers=n_workers > 1, **dp_extra)
 
     return train_dataloader, val_dataloader, norm_stats, train_dataset.is_sim
 

@@ -36,6 +36,72 @@ SIM_TASK_CONFIGS = {
     },
 }
 
+def _act_dataset_size(dataset_dir):
+    """(num_episodes, episode_len) of a converted ACT dataset dir, read at import time.
+
+    Used by the pc_suite rows, whose datasets land while training is being set up, so the
+    counts cannot be pasted in by hand.
+
+    * Dir missing / no episode_0.hdf5 -> (0, 0). Never raises: imitate_episodes then fails
+      loudly in load_data (empty train split) instead of training on nothing.
+    * Episodes are counted contiguously from episode_0.hdf5: load_data reads range(N), so a
+      gap ends the usable set.
+    * convert_meta.json (written last by scripts/convert_obstacle_to_act.py) is the cache:
+      when it agrees with the files no hdf5 is opened. Otherwise each counted file's /action
+      length is read and episode_len = max T + 2 (the converter's rule, as in the rows below).
+    """
+    import json
+    import sys
+
+    root = pathlib.Path(dataset_dir)
+    n = 0
+    while (root / f'episode_{n}.hdf5').is_file():
+        n += 1
+    if n == 0:
+        return 0, 0
+    meta = None
+    try:
+        meta = json.loads((root / 'convert_meta.json').read_text())
+    except (OSError, ValueError):
+        meta = None
+    if isinstance(meta, dict):
+        meta_n = int(meta.get('num_episodes') or 0)
+        meta_len = int(meta.get('episode_len') or 0)
+        # meta_n < n: stale higher-numbered files from an older conversion; the first meta_n are this one.
+        if 0 < meta_n <= n and meta_len > 0:
+            return meta_n, meta_len
+    import h5py
+
+    max_t = 0
+    for i in range(n):
+        try:
+            with h5py.File(root / f'episode_{i}.hdf5', 'r') as h5:
+                max_t = max(max_t, int(h5['/action'].shape[0]))
+        except (OSError, KeyError):
+            n = i  # unreadable (still being written): the usable set ends here
+            break
+    print(
+        f"[constants] WARNING {root}: no matching convert_meta.json (conversion still running?); "
+        f"scanned hdf5: num_episodes={n} episode_len={max_t + 2 if n else 0}",
+        file=sys.stderr,
+    )
+    return n, (max_t + 2 if n else 0)
+
+
+def _pc_suite_task(suite):
+    """TASK_CONFIGS row for one pc_suite dataset (act_style_data/pc_suite/<suite>)."""
+    dataset_dir = ACT_DATA_DIR / 'pc_suite' / suite
+    num_episodes, episode_len = _act_dataset_size(dataset_dir)
+    return {
+        'dataset_dir': str(dataset_dir),
+        'num_episodes': num_episodes,
+        'episode_len': episode_len,
+        'state_dim': 9,
+        'action_dim': 8,
+        'camera_names': ['exo_camera_1', 'wrist_camera'],
+    }
+
+
 # This project's tasks. All three are the one-env fumehood obstacle pick; they differ
 # only in whether the dataset carries proximity and whether the hazard bar is visible
 # to the RGB cameras. Dataset paths are produced by scripts/convert_obstacle_to_act.py.
@@ -256,6 +322,78 @@ TASK_CONFIGS = {
         'action_dim': 8,
         'camera_names': ['wrist_camera'],
     },
+    # pc_suite (ICLR rebuttal, 2026-10-13): five suites on the hybrid-skin FR3, exo + wrist RGB,
+    # 40-sensor skin, policy_dt 66 ms, task_horizon 600. Datagen config -> converter:
+    #   python -m scripts.convert_obstacle_to_act --src <run_dir> \
+    #       --dst act_style_data/pc_suite/<suite> \
+    #       --with_proximity --prox_pool min --image_h 240 --image_w 320
+    # num_episodes / episode_len come from the dataset dir at import time (_act_dataset_size):
+    # 0 / 0 until the conversion has run. Train: scripts/exp/train_<suite>.sh. Closed-loop
+    # eval: scripts/exp/eval_<suite>.sh = eval_act_place.py --env <suite>.
+    # Fume hood, non-prehensile push (FrankaSkinPCFumehoodPushConfig).
+    'pc_fumehood_push': _pc_suite_task('pc_fumehood_push'),
+    # Shelf unit, pick-and-place (FrankaSkinPCShelfPnPConfig).
+    'pc_shelf_pnp': _pc_suite_task('pc_shelf_pnp'),
+    # Shelf unit, non-prehensile push (FrankaSkinPCShelfPushConfig).
+    'pc_shelf_push': _pc_suite_task('pc_shelf_push'),
+    # Kitchen room, pick-and-place (FrankaSkinPCKitchenPnPConfig).
+    'pc_kitchen_pnp': _pc_suite_task('pc_kitchen_pnp'),
+    # Kitchen room, non-prehensile push (FrankaSkinPCKitchenPushConfig).
+    'pc_kitchen_push': _pc_suite_task('pc_kitchen_push'),
+    # Fume-hood push with the 2026-10-13 top-up (99 original demos + FrankaSkinPCFumehoodPushRangeConfig
+    # houses 1024+). Same environment / eval world as pc_fumehood_push.
+    'pc_fumehood_push_x2': _pc_suite_task('pc_fumehood_push_x2'),
+    # Hard variants (2026-10-13 15:10): tighter geometry + DART action-noise demos + light-contact mix.
+    'pc_shelf_pnp_hard': _pc_suite_task('pc_shelf_pnp_hard'),
+    'pc_kitchen_pnp_hard': _pc_suite_task('pc_kitchen_pnp_hard'),
+    'pc_fumehood_push_hard': _pc_suite_task('pc_fumehood_push_hard'),
+    # Arm-link hazard suite (2026-10-13 23:40): jar moved under the kitchen wall cabinets with a
+    # top-down hand; the skinned wrist knuckle / forearm ride 1.5-3.5 cm under the cabinets while
+    # the gripper / link7 keep >= 6 cm (FrankaSkinPCKitchenReachConfig, DART demos, light-contact gate).
+    'pc_kitchen_reach': _pc_suite_task('pc_kitchen_reach'),
+    # Hidden-hazard kitchen (2026-10-14): pc_kitchen_reach + an under-cabinet radio hidden from both
+    # cameras (light rail), present in 50 % of episodes at a random place; the expert dips the
+    # skinned wrist / forearm under it (FrankaSkinPCKitchenBlindConfig, DART demos, light-contact gate).
+    'pc_kitchen_blind': _pc_suite_task('pc_kitchen_blind'),
+    # Hidden-hazard shelf (2026-10-14, BLINDSHELF): can from the back of a tall pantry bay; an
+    # under-shelf basket invisible to both cameras hangs left or right of the lane (50/50); the expert
+    # tilts the hand so the skinned wrist / forearm pass the free side (FrankaSkinPCShelfBlindConfig,
+    # DART demos, light-contact gate).
+    'pc_shelf_blind': _pc_suite_task('pc_shelf_blind'),
+    # Hidden-hazard shelf, NON-PREHENSILE (2026-10-14, BLINDPUSH): pc_shelf_blind's hidden basket; fingers
+    # closed, push a flat box from the bay front to the label by the back panel; the expert tilts the hand so
+    # the skinned wrist / forearm pass the free side (FrankaSkinPCShelfPushBlindConfig, DART demos, gate).
+    'pc_shelf_push_blind': _pc_suite_task('pc_shelf_push_blind'),
+    # pc_shelf_blind with the fixed-tilt hole closed (2026-10-14, BLINDSHELF2): same can pick-and-place,
+    # the hidden basket's two positions closer together so no fixed hand tilt passes both
+    # (FrankaSkinPCShelf2BlindConfig, DART demos, light-contact gate, skin recorded once per step).
+    'pc_shelf2_blind': _pc_suite_task('pc_shelf2_blind'),
+    # Hidden-hazard lab bench (2026-10-14, BLINDLAB): reagent bottle / beaker from the back of a lab bench under
+    # the reagent shelf; an under-shelf service fixture invisible to both cameras hangs left or right of the lane
+    # (50/50); the expert tilts the hand so the skinned wrist / forearm pass the free side
+    # (FrankaSkinPCLabBlindConfig, DART demos, light-contact gate, skin once per policy step).
+    'pc_lab_blind': _pc_suite_task('pc_lab_blind'),
+    # Hidden-hazard kitchen sink base (2026-10-14, BLINDSINK): bottle from the back of the cabinet under a sink;
+    # the drain pipe hangs left or right of the lane (50/50), hidden from both cameras by the false front; the
+    # expert tilts the hand so the skinned wrist / forearm pass the dry side (FrankaSkinPCSinkBlindConfig, DART
+    # demos, light-contact gate, skin once per policy step, robot on a low 15 cm base).
+    'pc_sink_blind': _pc_suite_task('pc_sink_blind'),
+    # Occluded natural item (2026-10-15, OCC_CABINET): bottle from the back of a kitchen pots cabinet; a frying pan
+    # on the half-depth shelf (left or right, hidden from both cameras by the drawer above the opening) sticks its
+    # handle out at the skinned wrist; the expert tilts the hand away (FrankaSkinPCOccCabinetConfig, DART demos, gate).
+    'pc_occ_cabinet': _pc_suite_task('pc_occ_cabinet'),
+    # Occluded natural item (2026-10-15, OCC_PANTRY): jar / tin from the back of a pantry bay; two china espresso
+    # cups hang on cup hooks under the shelf above (left or right, hidden from both cameras: shelf board / wrist camera
+    # looks down); the expert tilts the hand away (FrankaSkinPCOccPantryConfig, DART demos, gate, skin once per step).
+    'pc_occ_pantry': _pc_suite_task('pc_occ_pantry'),
+    # Occluded natural item (2026-10-15, OCC_DESK): cup from behind a home-office monitor to a coaster; an adjustable
+    # desk lamp behind the monitor (left or right, hidden from both cameras) overhangs the skinned wrist; the expert
+    # tilts the hand away (FrankaSkinPCOccDeskConfig, DART demos, gate, skin once per policy step).
+    'pc_occ_desk': _pc_suite_task('pc_occ_desk'),
+    # Occluded natural item (2026-10-15, OCC_FRIDGE): jar from the back of an open fridge's lowest shelf to a plate;
+    # two wine bottles lie in a wine rack under the shelf above (left or right, hidden from both cameras: shelf /
+    # wrist camera looks down); the expert tilts the hand away (FrankaSkinPCOccFridgeConfig, DART demos, gate).
+    'pc_occ_fridge': _pc_suite_task('pc_occ_fridge'),
 }
 
 ### Simulation envs fixed constants

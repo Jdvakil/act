@@ -125,6 +125,12 @@ def get_args_parser():
     parser.add_argument('--image_dropout_mode', type=str, default='all',
                         choices=('all', 'single'))
     parser.add_argument('--no_zero_latent_on_drop', action='store_true')
+    # Mixed-precision flag consumed by imitate_episodes.py (no-op here, argv re-parse).
+    parser.add_argument('--amp', type=str, default='none', choices=('none', 'bf16'))
+    # Skin-noise flags consumed by imitate_episodes.py (no-op here, argv re-parse).
+    parser.add_argument('--prox_noise_std', type=float, default=0.0)
+    parser.add_argument('--prox_noise_rel', type=float, default=0.0)
+    parser.add_argument('--prox_pixel_dropout', type=float, default=0.0)
 
     return parser
 
